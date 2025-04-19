@@ -5,7 +5,75 @@ from cryptography.hazmat.primitives.serialization import PublicFormat, Encoding
 from cryptography.hazmat.primitives import hashes
 
 
-class PQXDH:
+class PQXDHServer:
+    """
+    Post-Quantum Extended Diffie-Hellman (PQXDH) implementation.
+    Combines classical X448 with a post-quantum KEM algorithm.
+    """
+
+    def __init__(self, pq_algorithm="ML-KEM-1024"):
+        """
+        Initialize the PQXDH key exchange.
+        """
+        self.pq_algorithm = pq_algorithm
+        self.classical_private_key = None
+        self.classical_public_key = None
+        self.shared_secret = None
+
+    def generate_keys(self):
+        """Generate both classical and post-quantum key pairs"""
+        # Generate classical X25519 (elliptic curve) keys
+        self.classical_private_key = x448.X448PrivateKey.generate()
+        self.classical_public_key = self.classical_private_key.public_key()
+
+        return {
+            "classical_public": self.classical_public_key.public_bytes(
+                Encoding.Raw, PublicFormat.Raw
+            ),
+        }
+
+    def exchange(
+        self, client_classical_public: bytes, client_pq_public: bytes
+    ) -> bytes:
+        """
+        Recieves public keys from client, computes classical shared secret,
+        create and send pq ciphertext.
+        This is the server's part of the key exchange.
+
+        Args:
+            client_classical_public (bytes): EC public key from client
+            client_pq_public (bytes): PQ public key from client
+
+            Returns:
+                bytes: ciphertext to send to client
+        """
+        # Classical part - works like traditional Diffie-Hellman
+        # Both parties can derive the same shared secret without sending anything else
+        client_classical_key = x448.X448PublicKey.from_public_bytes(
+            client_classical_public
+        )
+        classical_shared = self.classical_private_key.exchange(client_classical_key)
+
+        # Post-quantum part - uses Key Encapsulation Mechanism
+        # This creates:
+        # 1. A random secret that we know
+        # 2. A ciphertext that encapsulates this secret for the peer
+        # We must send the ciphertext to the peer - NOT the secret itself
+        ciphertext, pq_secret = oqs.KeyEncapsulation(self.pq_algorithm).encap_secret(
+            client_pq_public
+        )
+
+        # create secret from classical shared secret and pq_secret
+        self.shared_secret = HKDF(
+            algorithm=hashes.SHA512(), length=32, salt=None, info=b"PQXDH-Shared-Secret"
+        ).derive(classical_shared + pq_secret)
+
+        # Return the ciphertext - this must be sent to the peer
+        # The secret itself is never transmitted
+        return ciphertext
+
+
+class PQXDHClient:
     """
     Post-Quantum Extended Diffie-Hellman (PQXDH) implementation.
     Combines classical X448 with a post-quantum KEM algorithm.
@@ -23,10 +91,8 @@ class PQXDH:
         self.classical_public_key = None
         self.pq_client = None
         self.pq_public_key = None
-        self.pq_secret = None
         self.shared_secret = None
         self.classical_shared = None  # Store classical shared secret
-        self.peer_ciphertext = None  # Store peer's ciphertext
 
     def generate_keys(self):
         """Generate both classical and post-quantum key pairs"""
@@ -47,57 +113,36 @@ class PQXDH:
             "pq_public": self.pq_public_key,
         }
 
-    def process_peer_keys(self, peer_classical_public, peer_pq_public):
+    def exchange(self, server_classical_public: bytes):
         """
-        Process the peer's public keys.
-
-        For the classical part (ECDH):
-        - We compute a shared secret using our private key and peer's public key
-        - No information needs to be sent back
-
-        For the post-quantum part (KEM):
-        - We generate a random secret and encapsulate it against peer's public key
-        - We get a ciphertext that only the peer can decrypt
-        - We must send this ciphertext to the peer
+        Recieves public keys from server, computes classical shared secret
+        This is the client's part of the key exchange.
 
         Args:
-            peer_classical_public (bytes): Peer's classical public key
-            peer_pq_public (bytes): Peer's post-quantum public key
+            server_classical_public (bytes): EC public key from server
 
-        Returns:
-            bytes: Contains ciphertext to send to peer
         """
         # Classical part - works like traditional Diffie-Hellman
         # Both parties can derive the same shared secret without sending anything else
-        peer_classical_key = x448.X448PublicKey.from_public_bytes(peer_classical_public)
-        self.classical_shared = self.classical_private_key.exchange(peer_classical_key)
-
-        # Post-quantum part - uses Key Encapsulation Mechanism
-        # This creates:
-        # 1. A random secret that we know
-        # 2. A ciphertext that encapsulates this secret for the peer
-        # We must send the ciphertext to the peer - NOT the secret itself
-        ciphertext, self.pq_secret = oqs.KeyEncapsulation(
-            self.pq_algorithm
-        ).encap_secret(peer_pq_public)
-
-        # Return the ciphertext - this must be sent to the peer
-        # The secret itself is never transmitted
-        return ciphertext
+        server_classical_key = x448.X448PublicKey.from_public_bytes(
+            server_classical_public
+        )
+        self.classical_shared = self.classical_private_key.exchange(
+            server_classical_key
+        )
 
     def decapsulate(self, peer_ciphertext):
         """
-        Decapsulate the peer's ciphertext to get the shared secret.
+        Decapsulate the server's ciphertext to get the shared secret.
 
-        The peer has created a random secret and encapsulated it for us.
+        The server has created a random secret and encapsulated it for us.
         We use our private key to recover that same secret from the ciphertext.
 
         At this point:
         - We know our classical shared secret (ECDH)
-        - We know our random PQ secret that we generated for the peer
-        - We know the peer's random PQ secret that they generated for us
+        - We can get the server's random PQ secret that they generated for us
 
-        We combine all three to create the final shared secret.
+        We combine these to create the final shared secret.
 
         Args:
             peer_ciphertext (bytes): The ciphertext from peer (NOT the secret itself)
@@ -110,23 +155,15 @@ class PQXDH:
 
         # Recover the peer's secret from their ciphertext
         # This is possible because we have the matching private key
-        peer_pq_secret = self.pq_client.decap_secret(peer_ciphertext)
-
-        # order matters for the key derivation, sort to make it consistent
-        # without sorting, the clients would have different shared secrets
-        # because their pq_secrets would be flipped (peer vs self)
-        # technically only 1 pq_secret is needed, but we use both to maintain
-        # the same process for both parties
-        # This is not a security concern, but a consistency one
-        pq_secrets = sorted([self.pq_secret, peer_pq_secret])
+        server_pq_secret = self.pq_client.decap_secret(peer_ciphertext)
 
         # 1. Classical shared secret (traditional Diffie-Hellman)
-        # 2 & 3. The two PQ secrets in sorted order
+        # 2. Post-quantum secret (KEM)
         # length is 32 bytes (256 bits) for the HKDF output
         # for use as AES key
         self.shared_secret = HKDF(
             algorithm=hashes.SHA512(), length=32, salt=None, info=b"PQXDH-Shared-Secret"
-        ).derive(self.classical_shared + pq_secrets[0] + pq_secrets[1])
+        ).derive(self.classical_shared + server_pq_secret)
 
         return self.shared_secret
 
