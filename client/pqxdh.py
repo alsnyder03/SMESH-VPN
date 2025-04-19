@@ -27,7 +27,6 @@ class PQXDH:
         self.shared_secret = None
         self.classical_shared = None  # Store classical shared secret
         self.peer_ciphertext = None  # Store peer's ciphertext
-        print(oqs.get_enabled_kem_mechanisms())
 
     def generate_keys(self):
         """Generate both classical and post-quantum key pairs"""

@@ -22,26 +22,27 @@ The discovery server helps peers find each other on the network. It acts only as
 
 ## Installation
 
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/SMESH-VPN.git
+cd SMESH-VPN
+```
+
 Venv must exist
 
 ```bash
 python -m venv .venv
 ```
 
-```bash
+```ps
 ./.venv/Scripts/activate.ps1
 ```
 
-or equivalent for other operating system
-
 ```bash
-# Clone the repository
-git clone https://github.com/yourusername/SMESH-VPN.git
-cd SMESH-VPN
-
-# Install dependencies
-pip install -r requirements.txt
+./install.sh
 ```
+
+or equivalent for other operating system
 
 ## Usage
 
