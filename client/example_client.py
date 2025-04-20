@@ -6,20 +6,45 @@ import os
 import sys
 import uuid
 import logging
-from pathlib import Path
-from cryptography.hazmat.primitives.asymmetric import rsa
-from cryptography.hazmat.primitives.serialization import (
-    Encoding,
-    PrivateFormat,
-    PublicFormat,
-    NoEncryption,
-)
+import argparse
+from pqxdh import PQXDHServer, PQXDHClient
 
 # Configure logging
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger("mesh_vpn")
+
+# parse args for -p (port) and -i (ip) as well as -c (config file)
+parser = argparse.ArgumentParser(description="Mesh VPN Client")
+parser.add_argument(
+    "-p", "--port", type=int, default=9000, help="Port to listen on (default: 9000)"
+)
+parser.add_argument("-i", "--ip", type=str, default="10.10.0.1")
+parser.add_argument(
+    "-c",
+    "--config",
+    type=str,
+    default=None,
+    help="Path to config file (default: None)",
+)
+args = parser.parse_args()
+
+
+def print_banner():
+    """Print a banner with usage information"""
+    banner = """
+    ███████╗███╗   ███╗███████╗███████╗██╗  ██╗    ██╗   ██╗██████╗ ███╗   ██╗
+    ██╔════╝████╗ ████║██╔════╝██╔════╝██║  ██║    ██║   ██║██╔══██╗████╗  ██║
+    ███████╗██╔████╔██║█████╗  ███████╗███████║    ██║   ██║██████╔╝██╔██╗ ██║
+    ╚════██║██║╚██╔╝██║██╔══╝  ╚════██║██╔══██║    ╚██╗ ██╔╝██╔═══╝ ██║╚██╗██║
+    ███████║██║ ╚═╝ ██║███████╗███████║██║  ██║     ╚████╔╝ ██║     ██║ ╚████║
+    ╚══════╝╚═╝     ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝      ╚═══╝  ╚═╝     ╚═╝  ╚═══╝
+    
+    Post-Quantum Secure Mesh VPN Client
+    -----------------------------------
+    """
+    print(banner)
 
 
 class MeshVPNClient:
@@ -29,17 +54,22 @@ class MeshVPNClient:
         self.connections = {}
         self.running = False
         self.config = self.load_config(config_path)
-        self.private_key = self.load_or_create_keys()
+        self.discovery_connection: socket.socket = None
 
     def load_config(self, config_path):
         default_config = {
             "listen_port": 9000,
-            "discovery_servers": ["mesh-discovery.example.com:8000"],
+            "discovery_servers": ["127.0.0.1:8000"],
             "interface": "tun0",
             "subnet": "10.10.0.0/24",
             "local_ip": "10.10.0.1",
             "keepalive_interval": 15,
         }
+
+        if args.ip:
+            default_config["local_ip"] = args.ip
+        if args.port:
+            default_config["listen_port"] = args.port
 
         if config_path and os.path.exists(config_path):
             try:
@@ -51,70 +81,40 @@ class MeshVPNClient:
 
         return default_config
 
-    def load_or_create_keys(self):
-        key_path = Path.home() / ".mesh_vpn" / "keys"
-        key_path.mkdir(parents=True, exist_ok=True)
-        private_key_path = key_path / "private_key.pem"
-
-        if private_key_path.exists():
-            # Load existing keys
-            with open(private_key_path, "rb") as key_file:
-                private_key = rsa.load_der_private_key(key_file.read(), password=None)
-        else:
-            # Generate new keys
-            private_key = rsa.generate_private_key(
-                public_exponent=65537,
-                key_size=2048,
-            )
-            # Save the private key
-            with open(private_key_path, "wb") as key_file:
-                key_file.write(
-                    private_key.private_bytes(
-                        encoding=Encoding.DER,
-                        format=PrivateFormat.PKCS8,
-                        encryption_algorithm=NoEncryption(),
-                    )
-                )
-
-            # Save the public key
-            public_key = private_key.public_key()
-            with open(key_path / "public_key.pem", "wb") as key_file:
-                key_file.write(
-                    public_key.public_bytes(
-                        encoding=Encoding.DER, format=PublicFormat.SubjectPublicKeyInfo
-                    )
-                )
-
-        return private_key
-
     def discover_peers(self):
         """Connect to discovery servers to find peers"""
         for server in self.config["discovery_servers"]:
             try:
-                host, port = server.split(":")
-                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.connect((host, int(port)))
-                    # Register with discovery server
-                    registration = {
-                        "node_id": self.node_id,
-                        "listen_port": self.config["listen_port"],
-                        "public_key": self.private_key.public_key()
-                        .public_bytes(
-                            encoding=Encoding.DER,
-                            format=PublicFormat.SubjectPublicKeyInfo,
-                        )
-                        .hex(),
-                    }
-                    s.sendall(json.dumps(registration).encode() + b"\n")
+                # Register with discovery server
+                registration = {
+                    "node_id": self.node_id,
+                    "listen_port": self.config["listen_port"],
+                }
 
-                    # Get peer list
-                    data = s.recv(4096)
-                    peer_list = json.loads(data.decode())
-                    for peer in peer_list:
-                        if peer["node_id"] != self.node_id:
-                            self.peers[peer["node_id"]] = peer
+                logger.debug(
+                    f"Registering with discovery server {server}: {registration}"
+                )
+                host, port = server.split(":")
+                self.discovery_connection = socket.socket(
+                    socket.AF_INET, socket.SOCK_STREAM
+                )
+                self.discovery_connection.connect((host, int(port)))
+                self.discovery_connection.settimeout(5)
+
+                self.discovery_connection.sendall(
+                    json.dumps(registration).encode() + b"\n"
+                )
+
+                # Get peer list
+                data = self.discovery_connection.recv(4096)
+                peer_list = json.loads(data.decode())
+                for peer in peer_list:
+                    if peer["node_id"] != self.node_id:
+                        self.peers[peer["node_id"]] = peer
             except Exception as e:
                 logger.error(f"Failed to discover peers via {server}: {e}")
+                self.discovery_connection.close()
+                self.discovery_connection = None
 
     def setup_virtual_interface(self):
         """Set up virtual network interface for VPN tunnel"""
@@ -135,45 +135,6 @@ class MeshVPNClient:
                 )
         except Exception as e:
             logger.error(f"Failed to set up virtual interface: {e}")
-
-    def connect_to_peer(self, peer_id, peer_info):
-        """Establish connection to a peer"""
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.connect((peer_info["host"], peer_info["listen_port"]))
-
-            # TODO: Implement mutual authentication with SSL/TLS
-
-            # Create a peer connection object
-            connection = {
-                "socket": s,
-                "peer_id": peer_id,
-                "last_seen": time.time(),
-                "encrypt_thread": None,
-                "decrypt_thread": None,
-            }
-
-            self.connections[peer_id] = connection
-
-            # Start connection handling threads
-            connection["encrypt_thread"] = threading.Thread(
-                target=self.handle_outgoing_traffic, args=(peer_id,)
-            )
-            connection["decrypt_thread"] = threading.Thread(
-                target=self.handle_incoming_traffic, args=(peer_id,)
-            )
-
-            connection["encrypt_thread"].daemon = True
-            connection["decrypt_thread"].daemon = True
-
-            connection["encrypt_thread"].start()
-            connection["decrypt_thread"].start()
-
-            logger.info(f"Connected to peer {peer_id}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect to peer {peer_id}: {e}")
-            return False
 
     def listen_for_connections(self):
         """Listen for incoming connections from peers"""
@@ -201,48 +162,96 @@ class MeshVPNClient:
         except Exception as e:
             logger.error(f"Failed to start listener: {e}")
 
-    def handle_new_connection(self, client_socket, addr):
+    def handle_connection(self, peer_id, s: socket.socket, key: bytes):
+        # Create a peer connection object
+        connection = {
+            "socket": s,
+            "last_seen": time.time(),
+            "encrypt_thread": None,
+            "decrypt_thread": None,
+            "key": key,
+        }
+
+        self.connections[peer_id] = connection
+
+        # Start connection handling threads
+        connection["encrypt_thread"] = threading.Thread(
+            target=self.handle_outgoing_traffic, args=(peer_id,), daemon=True
+        )
+
+        connection["decrypt_thread"] = threading.Thread(
+            target=self.handle_incoming_traffic, args=(peer_id,), daemon=True
+        )
+
+        connection["encrypt_thread"].start()
+        connection["decrypt_thread"].start()
+
+        logger.info(f"Connected to peer {peer_id}")
+
+    def connect_to_peer(self, peer_id, peer_info):
+        """Establish connection to a peer"""
+
+        # TODO: Implement mutual authentication with SSL/TLS
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.connect((peer_info["host"], peer_info["listen_port"]))
+
+            # PQXDH key exchange
+            client = PQXDHClient()
+            keys = client.generate_keys()
+
+            key_exchange = {
+                "node_id": self.node_id,
+                "classical_public": keys["classical_public"].hex(),
+                "pq_public": keys["pq_public"].hex(),
+            }
+
+            logger.debug(f"Key exchange data: {key_exchange}")
+            s.sendall(json.dumps(key_exchange).encode() + b"\n")
+
+            resp = s.recv(4096)
+
+            resp = json.loads(resp.decode())
+
+            client.exchange(
+                bytes.fromhex(resp["classical_public"]),
+                bytes.fromhex(resp["ciphertext"]),
+            )
+
+            self.handle_connection(peer_id, s, client.shared_secret)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to connect to peer {peer_id}: {e}")
+            return False
+
+    def handle_new_connection(self, client_socket: socket.socket, addr):
         """Handle a new incoming connection"""
         try:
             # TODO: Implement authentication
 
+            server = PQXDHServer()
+            classical_public = server.generate_keys()
+
             # For now, just a simple handshake
-            data = client_socket.recv(1024)
+            data = client_socket.recv(4096)
             handshake = json.loads(data.decode())
 
             if "node_id" in handshake:
                 peer_id = handshake["node_id"]
+                ciphertext = server.exchange(
+                    bytes.fromhex(handshake["classical_public"]),
+                    bytes.fromhex(handshake["pq_public"]),
+                )
 
-                # Create connection object
-                connection = {
-                    "socket": client_socket,
-                    "peer_id": peer_id,
-                    "last_seen": time.time(),
-                    "encrypt_thread": None,
-                    "decrypt_thread": None,
+                key_exchange = {
+                    "node_id": self.node_id,
+                    "classical_public": classical_public["classical_public"].hex(),
+                    "ciphertext": ciphertext.hex(),
                 }
 
-                self.connections[peer_id] = connection
+                client_socket.sendall(json.dumps(key_exchange).encode() + b"\n")
 
-                # Send response
-                response = {"node_id": self.node_id, "status": "connected"}
-                client_socket.sendall(json.dumps(response).encode())
-
-                # Start handling threads
-                connection["encrypt_thread"] = threading.Thread(
-                    target=self.handle_outgoing_traffic, args=(peer_id,)
-                )
-                connection["decrypt_thread"] = threading.Thread(
-                    target=self.handle_incoming_traffic, args=(peer_id,)
-                )
-
-                connection["encrypt_thread"].daemon = True
-                connection["decrypt_thread"].daemon = True
-
-                connection["encrypt_thread"].start()
-                connection["decrypt_thread"].start()
-
-                logger.info(f"Accepted connection from peer {peer_id}")
+                self.handle_connection(peer_id, client_socket, server.shared_secret)
             else:
                 client_socket.close()
                 logger.warning(f"Rejected connection from {addr} - invalid handshake")
@@ -255,10 +264,10 @@ class MeshVPNClient:
         # This would capture traffic from the tun interface and forward to the peer
         pass
 
-    def handle_incoming_traffic(self, peer_id):
+    def handle_incoming_traffic(self, peer_id: str):
         """Handle traffic coming from the peer"""
         # This would receive traffic from the peer and send to the tun interface
-        connection = self.connections.get(peer_id)
+        connection = self.connections[peer_id]
         if not connection:
             return
 
@@ -275,7 +284,7 @@ class MeshVPNClient:
                 # Process received data
                 # TODO: Write data to tun interface
                 connection["last_seen"] = time.time()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except Exception as e:
                 logger.error(f"Error receiving data from peer {peer_id}: {e}")
@@ -352,5 +361,6 @@ class MeshVPNClient:
 
 
 if __name__ == "__main__":
-    client = MeshVPNClient()
+    print_banner()
+    client = MeshVPNClient(args.config)
     client.start()

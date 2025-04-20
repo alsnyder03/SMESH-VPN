@@ -105,8 +105,8 @@ class MeshVPNDiscoveryServer:
 
             with self.lock:
                 for peer_id, info in self.peers.items():
-                    # Remove peers inactive for more than 10 minutes
-                    if current_time - info["last_seen"] > 600:
+                    # Remove peers inactive for more than 90 seconds
+                    if current_time - info["last_seen"] > 90:
                         inactive_peers.append(peer_id)
 
                 for peer_id in inactive_peers:

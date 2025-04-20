@@ -19,11 +19,9 @@ ciphertext = server.exchange(
     keys2["pq_public"],
 )
 
-client.exchange(keys1["classical_public"])
+client.exchange(keys1["classical_public"], ciphertext)
 # Step 3: Exchange ciphertexts for post quantum secret and complete the key exchange
 
-# Party 2 decapsulates ciphertext1 from Party 1
-client.decapsulate(ciphertext)
 
 # Step 4: Verify that both parties derived the same shared secret
 print(f"Party 1 Shared Secret: {server.shared_secret.hex()}")
