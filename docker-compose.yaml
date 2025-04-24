@@ -1,0 +1,71 @@
+version: "3"
+
+services:
+  discovery:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.discovery
+    container_name: smesh-discovery
+    ports:
+      - "8000:8000"
+    networks:
+      meshnet:
+        ipv4_address: 172.20.0.2
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    command: python server/discovery_server.py
+    volumes:
+      - ./server:/app/server
+
+  client1:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.client
+    container_name: smesh-client1
+    depends_on:
+      - discovery
+    networks:
+      meshnet:
+        ipv4_address: 172.20.0.10
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    command: python client/client.py --ip 10.10.0.10 --port 9010
+    restart: unless-stopped
+    environment:
+      - DISCOVERY_SERVER=172.20.0.2:8000
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./client:/app/client
+
+  client2:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.client
+    container_name: smesh-client2
+    depends_on:
+      - discovery
+    networks:
+      meshnet:
+        ipv4_address: 172.20.0.20
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    command: python client/client.py --ip 10.10.0.20 --port 9020
+    restart: unless-stopped
+    environment:
+      - DISCOVERY_SERVER=172.20.0.2:8000
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./client:/app/client
+
+networks:
+  meshnet:
+    driver: bridge
+    ipam:
+      driver: default
+      config:
+        - subnet: 172.20.0.0/16

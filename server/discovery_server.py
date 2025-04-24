@@ -1,8 +1,15 @@
 import socket
-import threading
 import json
-import time
+import threading
 import logging
+import time
+import os
+import sys
+import uuid
+
+# Add the parent directory to the path so we can import the common module
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+from common.pqxdh import PQXDHServer, PQXDHClient
 
 # Configure logging
 logging.basicConfig(
@@ -11,111 +18,193 @@ logging.basicConfig(
 logger = logging.getLogger("discovery_server")
 
 
-class MeshVPNDiscoveryServer:
-    def __init__(self, port=8000):
+class DiscoveryServer:
+    def __init__(self, host="0.0.0.0", port=8000):
+        self.host = host
         self.port = port
-        self.peers = {}
-        self.lock = threading.Lock()
+        self.peers = {}  # Dictionary to store registered peers
         self.running = False
+        self.lock = threading.Lock()  # For thread-safe peer list updates
+        self.node_id = str(uuid.uuid4())  # Generate a unique ID for this server
 
     def start(self):
         """Start the discovery server"""
         self.running = True
-        self.server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        logger.info(f"Starting discovery server on {self.host}:{self.port}")
+
+        # Create server socket
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
 
         try:
-            self.server_socket.bind(("0.0.0.0", self.port))
-            self.server_socket.listen(5)
-            logger.info(f"Discovery server listening on port {self.port}")
+            server_socket.bind((self.host, self.port))
+            server_socket.listen(5)
+            server_socket.settimeout(1)  # Allow checking self.running
 
-            # Start cleanup thread
-            cleanup_thread = threading.Thread(target=self.cleanup_inactive_peers)
-            cleanup_thread.daemon = True
-            cleanup_thread.start()
+            # Start maintenance thread for removing stale peers
+            maintenance_thread = threading.Thread(target=self._maintenance_loop)
+            maintenance_thread.daemon = True
+            maintenance_thread.start()
 
+            logger.info("Discovery server is running")
+
+            # Main accept loop
             while self.running:
                 try:
-                    client_socket, address = self.server_socket.accept()
-                    client_handler = threading.Thread(
-                        target=self.handle_client, args=(client_socket, address)
+                    client_socket, address = server_socket.accept()
+                    logger.info(f"Connection from {address}")
+
+                    # Handle client in a separate thread
+                    client_thread = threading.Thread(
+                        target=self._handle_client, args=(client_socket, address)
                     )
-                    client_handler.daemon = True
-                    client_handler.start()
+                    client_thread.daemon = True
+                    client_thread.start()
+
+                except socket.timeout:
+                    continue
                 except Exception as e:
-                    if self.running:
-                        logger.error(f"Error accepting connection: {e}")
-        except KeyboardInterrupt:
-            logger.info("Shutting down...")
+                    logger.error(f"Error accepting connection: {e}")
+
         except Exception as e:
             logger.error(f"Server error: {e}")
         finally:
-            self.stop()
+            server_socket.close()
+            logger.info("Server stopped")
 
     def stop(self):
         """Stop the discovery server"""
         self.running = False
-        if hasattr(self, "server_socket"):
-            self.server_socket.close()
-        logger.info("Discovery server stopped")
+        logger.info("Stopping discovery server")
 
-    def handle_client(self, client_socket, address):
-        """Handle client connection"""
+    def _handle_client(self, client_socket, address):
+        """Handle a client connection"""
         try:
-            logger.info(f"New connection from {address}")
+            # Receive data from client
             data = client_socket.recv(4096)
             if not data:
+                logger.warning(f"Empty data received from {address}")
+                client_socket.close()
                 return
 
-            peer_info = json.loads(data.decode())
+            # Parse registration data
+            registration = json.loads(data.decode().strip())
+            logger.info(f"Registration from {address}: {registration}")
 
-            # Add external IP and timestamp
-            peer_info["host"] = address[0]
-            peer_info["last_seen"] = time.time()
+            # Verify required fields
+            if "node_id" not in registration or "listen_port" not in registration:
+                logger.warning(f"Invalid registration from {address}")
+                client_socket.close()
+                return
 
-            # Update peer list
+            # Check if this is a secure request with PQXDH
+            if "classical_public" in registration and "pq_public" in registration:
+                # Setup secure connection with PQXDH
+                server = PQXDHServer()
+                server_keys = server.generate_keys()
+
+                # Process the client's public keys
+                try:
+                    client_classical_public = bytes.fromhex(
+                        registration["classical_public"]
+                    )
+                    client_pq_public = bytes.fromhex(registration["pq_public"])
+
+                    # Generate ciphertext for the client
+                    ciphertext = server.exchange(
+                        client_classical_public, client_pq_public
+                    )
+
+                    # Create response with our public key and ciphertext
+                    secure_response = {
+                        "status": "ok",
+                        "node_id": self.node_id,
+                        "classical_public": server_keys["classical_public"].hex(),
+                        "ciphertext": ciphertext.hex(),
+                    }
+
+                    # Send secure response
+                    client_socket.sendall(json.dumps(secure_response).encode() + b"\n")
+
+                    # Store the shared secret for future communications with this peer
+                    shared_secret = server.shared_secret
+                    logger.debug(
+                        f"Established secure connection with {registration['node_id']}"
+                    )
+
+                    # Continue with normal registration using secure channel
+                except Exception as e:
+                    logger.error(f"Error in secure key exchange: {e}")
+                    # Fall back to regular connection
+
+            # Store peer information
+            peer_id = registration["node_id"]
+            peer_info = {
+                "node_id": peer_id,
+                "host": address[0],
+                "listen_port": registration["listen_port"],
+                "last_seen": time.time(),
+            }
+
             with self.lock:
-                self.peers[peer_info["node_id"]] = peer_info
+                self.peers[peer_id] = peer_info
+                logger.info(
+                    f"Registered peer {peer_id} at {address[0]}:{registration['listen_port']}"
+                )
 
-            # Send peer list to client
+            # Send peer list back to client
             peer_list = []
             with self.lock:
-                for peer_id, info in self.peers.items():
-                    # Don't send the client's own info back
-                    if peer_id != peer_info["node_id"]:
-                        # Clone and remove sensitive data
-                        peer_data = info.copy()
-                        peer_data.pop("last_seen", None)
-                        peer_list.append(peer_data)
+                for pid, pinfo in self.peers.items():
+                    peer_list.append(pinfo)
 
-            client_socket.sendall(json.dumps(peer_list).encode())
-            logger.info(f"Sent peer list to {address}")
+            client_socket.sendall(json.dumps(peer_list).encode() + b"\n")
+            logger.info(f"Sent peer list with {len(peer_list)} peers to {peer_id}")
 
         except Exception as e:
             logger.error(f"Error handling client {address}: {e}")
+            import traceback
+
+            logger.error(traceback.format_exc())
         finally:
             client_socket.close()
 
-    def cleanup_inactive_peers(self):
-        """Remove peers that haven't connected in a while"""
+    def _maintenance_loop(self):
+        """Remove stale peers periodically"""
         while self.running:
-            time.sleep(60)  # Check every minute
-            current_time = time.time()
-            inactive_peers = []
+            try:
+                # Sleep first to allow initial connections
+                time.sleep(60)
 
-            with self.lock:
-                for peer_id, info in self.peers.items():
-                    # Remove peers inactive for more than 90 seconds
-                    if current_time - info["last_seen"] > 90:
-                        inactive_peers.append(peer_id)
+                with self.lock:
+                    now = time.time()
+                    stale_peers = []
 
-                for peer_id in inactive_peers:
-                    self.peers.pop(peer_id, None)
+                    # Find peers that haven't been seen for 5 minutes
+                    for peer_id, peer_info in self.peers.items():
+                        if now - peer_info["last_seen"] > 300:  # 5 minutes
+                            stale_peers.append(peer_id)
 
-            if inactive_peers:
-                logger.info(f"Removed {len(inactive_peers)} inactive peers")
+                    # Remove stale peers
+                    for peer_id in stale_peers:
+                        del self.peers[peer_id]
+                        logger.info(f"Removed stale peer {peer_id}")
+
+                    if stale_peers:
+                        logger.info(f"Removed {len(stale_peers)} stale peers")
+            except Exception as e:
+                logger.error(f"Error in maintenance loop: {e}")
 
 
 if __name__ == "__main__":
-    server = MeshVPNDiscoveryServer()
-    server.start()
+    # Use environment variables for configuration if available
+    host = os.environ.get("DISCOVERY_HOST", "0.0.0.0")
+    port = int(os.environ.get("DISCOVERY_PORT", 8000))
+
+    server = DiscoveryServer(host, port)
+    try:
+        server.start()
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+    finally:
+        server.stop()

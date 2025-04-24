@@ -1,2 +1,2 @@
 cryptography>=40.0.0
- kyber-py>=1.0.1
+kyber-py>=1.0.1

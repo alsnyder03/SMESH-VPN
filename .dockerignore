@@ -1,0 +1,30 @@
+# Python virtual environments
+.linux_venv/
+venv/
+env/
+.env/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Version control
+.git/
+.gitignore
+
+# Development files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs and databases
+*.log
+*.sqlite
+*.db
+
+# OS specific files
+.DS_Store
+Thumbs.db
