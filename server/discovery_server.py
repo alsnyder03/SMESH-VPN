@@ -6,10 +6,13 @@ import time
 import os
 import sys
 import uuid
+from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PrivateKey
+from cryptography.hazmat.primitives import serialization
 
 # Add the parent directory to the path so we can import the common module
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from common.pqxdh import PQXDHServer, PQXDHClient
+from common.aesgcm import encrypt_aes_gcm
 
 # Configure logging
 logging.basicConfig(
@@ -26,6 +29,8 @@ class DiscoveryServer:
         self.running = False
         self.lock = threading.Lock()  # For thread-safe peer list updates
         self.node_id = str(uuid.uuid4())  # Generate a unique ID for this server
+        self.identity_key = Ed448PrivateKey.generate()  # Generate server identity key
+        self.identity_public_key = self.identity_key.public_key()
 
     def start(self):
         """Start the discovery server"""
@@ -78,7 +83,7 @@ class DiscoveryServer:
         logger.info("Stopping discovery server")
 
     def _handle_client(self, client_socket, address):
-        """Handle a client connection"""
+        """Handle a client connection with secure key exchange"""
         try:
             # Receive data from client
             data = client_socket.recv(4096)
@@ -88,54 +93,64 @@ class DiscoveryServer:
                 return
 
             # Parse registration data
-            registration = json.loads(data.decode().strip())
-            logger.info(f"Registration from {address}: {registration}")
+            try:
+                registration = json.loads(data.decode().strip())
+                # Modify the registration logging to truncate the public keys to the first 8 characters
+                logger.info(f"Registration from {address}: {{'node_id': '{registration['node_id']}', 'listen_port': {registration['listen_port']}, 'classical_public': '{registration['classical_public'][:8]}', 'pq_public': '{registration['pq_public'][:8]}'}}")
+            except json.JSONDecodeError:
+                logger.warning(f"Invalid JSON received from {address}")
+                client_socket.close()
+                return
 
             # Verify required fields
-            if "node_id" not in registration or "listen_port" not in registration:
+            if "node_id" not in registration or "listen_port" not in registration or "classical_public" not in registration or "pq_public" not in registration:
                 logger.warning(f"Invalid registration from {address}")
                 client_socket.close()
                 return
 
-            # Check if this is a secure request with PQXDH
-            if "classical_public" in registration and "pq_public" in registration:
-                # Setup secure connection with PQXDH
-                server = PQXDHServer()
-                server_keys = server.generate_keys()
+            # Perform PQXDH key exchange
+            server = PQXDHServer()
+            server_keys = server.generate_keys()
 
-                # Process the client's public keys
-                try:
-                    client_classical_public = bytes.fromhex(
-                        registration["classical_public"]
-                    )
-                    client_pq_public = bytes.fromhex(registration["pq_public"])
+            try:
+                client_classical_public = bytes.fromhex(registration["classical_public"])
+                client_pq_public = bytes.fromhex(registration["pq_public"])
 
-                    # Generate ciphertext for the client
-                    ciphertext = server.exchange(
-                        client_classical_public, client_pq_public
-                    )
+                # Generate ciphertext for the client
+                ciphertext = server.exchange(client_classical_public, client_pq_public)
 
-                    # Create response with our public key and ciphertext
-                    secure_response = {
-                        "status": "ok",
-                        "node_id": self.node_id,
-                        "classical_public": server_keys["classical_public"].hex(),
-                        "ciphertext": ciphertext.hex(),
-                    }
+                # Create response with our public key and ciphertext
+                secure_response = {
+                    "classical_public": server_keys["classical_public"].hex(),
+                    "ciphertext": ciphertext.hex(),
+                }
 
-                    # Send secure response
-                    client_socket.sendall(json.dumps(secure_response).encode() + b"\n")
+                # Send length-prefixed JSON response
+                json_response = json.dumps(secure_response).encode()
+                length_prefix = len(json_response).to_bytes(4, byteorder='big')
+                client_socket.sendall(length_prefix + json_response)
 
-                    # Store the shared secret for future communications with this peer
-                    shared_secret = server.shared_secret
-                    logger.debug(
-                        f"Established secure connection with {registration['node_id']}"
-                    )
+                # Store the shared secret for future communications with this peer
+                shared_secret = server.shared_secret
 
-                    # Continue with normal registration using secure channel
-                except Exception as e:
-                    logger.error(f"Error in secure key exchange: {e}")
-                    # Fall back to regular connection
+                # Add logging to confirm shared secret derivation
+                logger.info(f"Derived shared secret with client: {shared_secret.hex()}")
+
+                # Encrypt and send the peer list
+                peer_list = []
+                with self.lock:
+                    for pid, pinfo in self.peers.items():
+                        peer_list.append(pinfo)
+
+                encrypted_peer_list = encrypt_aes_gcm(shared_secret, json.dumps(peer_list).encode())
+                client_socket.sendall(encrypted_peer_list)
+                logger.info(f"Sent peer list with {len(peer_list)} peers to {registration['node_id']}")
+                logger.debug(f"Sending peer list: {peer_list}")
+
+            except Exception as e:
+                logger.error(f"Error in secure key exchange: {e}")
+                client_socket.close()
+                return
 
             # Store peer information
             peer_id = registration["node_id"]
@@ -148,23 +163,12 @@ class DiscoveryServer:
 
             with self.lock:
                 self.peers[peer_id] = peer_info
-                logger.info(
-                    f"Registered peer {peer_id} at {address[0]}:{registration['listen_port']}"
-                )
-
-            # Send peer list back to client
-            peer_list = []
-            with self.lock:
-                for pid, pinfo in self.peers.items():
-                    peer_list.append(pinfo)
-
-            client_socket.sendall(json.dumps(peer_list).encode() + b"\n")
-            logger.info(f"Sent peer list with {len(peer_list)} peers to {peer_id}")
+                logger.info(f"Registered peer {peer_id} at {address[0]}:{registration['listen_port']}")
+                logger.debug(f"Registering peer: {peer_info}")
 
         except Exception as e:
             logger.error(f"Error handling client {address}: {e}")
             import traceback
-
             logger.error(traceback.format_exc())
         finally:
             client_socket.close()
