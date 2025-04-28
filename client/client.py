@@ -8,16 +8,18 @@ import uuid
 import logging
 import argparse
 import struct
-
-# import fcntl
+import fcntl
 
 # Add the parent directory to the path so we can import the common module
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from common.pqxdh import PQXDHServer, PQXDHClient
+from common.aesgcm import decrypt_aes_gcm, encrypt_aes_gcm
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from ipaddress import ip_address, IPv4Network
+from cryptography.hazmat.primitives.asymmetric.ed448 import Ed448PrivateKey, Ed448PublicKey
+from cryptography.hazmat.primitives import serialization
 
 # Configure logging
 logging.basicConfig(
@@ -74,7 +76,7 @@ def print_banner():
     ╚════██║██║╚██╔╝██║██╔══╝  ╚════██║██╔══██║    ╚██╗ ██╔╝██╔═══╝ ██║╚██╗██║
     ███████║██║ ╚═╝ ██║███████╗███████║██║  ██║     ╚████╔╝ ██║     ██║ ╚████║
     ╚══════╝╚═╝     ╚═╝╚══════╝╚══════╝╚═╝  ╚═╝      ╚═══╝  ╚═╝     ╚═╝  ╚═══╝
-    
+
     Post-Quantum Secure Mesh VPN Client
     -----------------------------------
     """
@@ -135,38 +137,93 @@ class MeshVPNClient:
         return default_config
 
     def discover_peers(self):
-        """Connect to discovery servers to find peers"""
+        """Connect to discovery servers to find peers with secure key exchange and decryption"""
         for server in self.config["discovery_servers"]:
             try:
+                # Perform PQXDH key exchange
+                client = PQXDHClient()
+                keys = client.generate_keys()
+
                 # Register with discovery server
                 registration = {
                     "node_id": self.node_id,
                     "listen_port": self.config["listen_port"],
+                    "classical_public": keys["classical_public"].hex(),
+                    "pq_public": keys["pq_public"].hex(),
                 }
 
-                logger.debug(
-                    f"Registering with discovery server {server}: {registration}"
-                )
+                logger.debug(f"Registering with discovery server {server}: {registration}")
                 host, port = server.split(":")
-                self.discovery_connection = socket.socket(
-                    socket.AF_INET, socket.SOCK_STREAM
-                )
+                self.discovery_connection = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 self.discovery_connection.connect((host, int(port)))
                 self.discovery_connection.settimeout(5)
 
-                self.discovery_connection.sendall(
-                    json.dumps(registration).encode() + b"\n"
-                )
+                self.discovery_connection.sendall(json.dumps(registration).encode() + b"\n")
 
-                # Get peer list
-                data = self.discovery_connection.recv(4096)
-                peer_list = json.loads(data.decode())
-                for peer in peer_list:
-                    if peer["node_id"] != self.node_id:
-                        self.peers[peer["node_id"]] = peer
+                # Read the length prefix (4 bytes)
+                length_bytes = self.discovery_connection.recv(4)
+                if not length_bytes:
+                    logger.error(f"No response received from {server}")
+                    continue
+
+                # Get the actual length and read exactly that many bytes
+                response_length = int.from_bytes(length_bytes, byteorder='big')
+                data = self.discovery_connection.recv(response_length)
+
+                try:
+                    server_response = json.loads(data.decode("utf-8"))
+                    logger.debug(f"Decoded server response: {server_response}")
+                except (UnicodeDecodeError, json.JSONDecodeError) as e:
+                    logger.error(f"Failed to decode server response from {server}: {e}")
+
+                server_classical_public = bytes.fromhex(server_response["classical_public"])
+                server_ciphertext = bytes.fromhex(server_response["ciphertext"])
+
+                # Derive shared secret
+                retries = 3
+                while retries > 0:
+                    try:
+                        client.exchange(server_classical_public, server_ciphertext)
+                        shared_secret = client.shared_secret
+                        #logger.info(f"Derived shared secret with discovery server: {shared_secret.hex()}")
+                        break
+                    except Exception as e:
+                        logger.warning(f"Key exchange failed, retrying... ({3 - retries + 1}/3)")
+                        retries -= 1
+                        time.sleep(1)
+                if retries == 0:
+                    logger.error("Key exchange failed after retries")
+                    continue
+
+                # Receive encrypted peer list
+                encrypted_data = self.discovery_connection.recv(4096)
+                if isinstance(encrypted_data, bytes):
+                    try:
+                        plaintext = decrypt_aes_gcm(shared_secret, encrypted_data)
+                        peer_list = json.loads(plaintext.decode("utf-8"))
+                    except Exception as e:
+                        logger.error(f"Failed to decrypt or decode server response: {e}")
+                        self.discovery_connection.close()
+                        return
+
+                # Process the peer list
+                if isinstance(peer_list, list):
+                    for peer in peer_list:
+                        if peer["node_id"] != self.node_id:  # Exclude self from peer list
+                            self.peers[peer["node_id"]] = peer
+                        else:
+                            logger.debug(f"Excluded self from peer list: {peer}")
+                    logger.info(f"Discovered {len(self.peers)} peers from discovery server")
+                else:
+                    logger.error("Unexpected decrypted peer list format. Expected a list.")
+
+            except ValueError as ve:
+                logger.error(f"Value error during peer discovery via {server}: {ve}")
             except Exception as e:
                 logger.error(f"Failed to discover peers via {server}: {e}")
-                self.discovery_connection.close()
+            finally:
+                if self.discovery_connection:
+                    self.discovery_connection.close()
                 self.discovery_connection = None
 
     def setup_virtual_interface(self):
@@ -344,17 +401,6 @@ class MeshVPNClient:
             logger.error("TUN device not initialized")
             return
 
-        # Generate a random IV for each packet
-        def encrypt_packet(data):
-            iv = os.urandom(16)  # 16 bytes IV for AES
-            encryptor = Cipher(
-                algorithms.AES(connection["key"]),
-                modes.GCM(iv),
-                backend=default_backend(),
-            ).encryptor()
-            ciphertext = encryptor.update(data) + encryptor.finalize()
-            return iv + encryptor.tag + ciphertext
-
         try:
             # Use the shared TUN file descriptor instead of creating a new one
             while self.running and peer_id in self.connections:
@@ -362,13 +408,11 @@ class MeshVPNClient:
                     # Read a packet from TUN device (MTU sized)
                     packet = os.read(self.tun_fd, 4096)
                     if packet:
-                        # Encrypt the packet
-                        encrypted_packet = encrypt_packet(packet)
+                        # Encrypt the packet using AES-GCM
+                        encrypted_packet = encrypt_aes_gcm(connection["key"], packet)
 
                         # Send to peer with length prefix
-                        packet_length = len(encrypted_packet).to_bytes(
-                            4, byteorder="big"
-                        )
+                        packet_length = len(encrypted_packet).to_bytes(4, byteorder="big")
                         connection["socket"].sendall(packet_length + encrypted_packet)
                 except BlockingIOError:
                     # No data available, sleep briefly
@@ -377,7 +421,7 @@ class MeshVPNClient:
                 except TimeoutError:
                     # send keepalive packets
                     keepalive_packet = b"KEEPALIVE"
-                    encrypted_packet = encrypt_packet(keepalive_packet)
+                    encrypted_packet = encrypt_aes_gcm(connection["key"], keepalive_packet)
                     packet_length = len(encrypted_packet).to_bytes(4, byteorder="big")
                     connection["socket"].sendall(packet_length + encrypted_packet)
                     continue
@@ -405,19 +449,6 @@ class MeshVPNClient:
             logger.error("TUN device not initialized")
             return
 
-        def decrypt_packet(encrypted_data):
-            iv = encrypted_data[:16]  # First 16 bytes are the IV
-            tag = encrypted_data[16:32]  # Next 16 bytes are GCM tag
-            ciphertext = encrypted_data[32:]  # Rest is ciphertext
-
-            decryptor = Cipher(
-                algorithms.AES(connection["key"]),
-                modes.GCM(iv, tag),
-                backend=default_backend(),
-            ).decryptor()
-
-            return decryptor.update(ciphertext) + decryptor.finalize()
-
         try:
             while self.running and peer_id in self.connections:
                 try:
@@ -430,8 +461,8 @@ class MeshVPNClient:
                     packet_length = int.from_bytes(length_bytes, byteorder="big")
                     encrypted_data = socket.recv(packet_length)
 
-                    # Decrypt the packet
-                    packet = decrypt_packet(encrypted_data)
+                    # Decrypt the packet using AES-GCM
+                    packet = decrypt_aes_gcm(connection["key"], encrypted_data)
                     connection["last_seen"] = time.time()
 
                     # Write to TUN device if not keepalive
