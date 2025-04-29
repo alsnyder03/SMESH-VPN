@@ -37,6 +37,7 @@ services:
     command: sh -c "sleep 2 && python client/client.py"
     restart: unless-stopped
     environment:
+      - HTTP_SERVER=true
       - DISCOVERY_SERVER=172.20.0.2:8000
       - IP_ADDRESS=10.10.0.10
       - PORT=9010
@@ -65,6 +66,7 @@ services:
     command: sh -c "sleep 5 && python client/client.py"
     restart: unless-stopped
     environment:
+      - HTTP_SERVER=true
       - DISCOVERY_SERVER=172.20.0.2:8000
       - IP_ADDRESS=10.10.0.20
       - PORT=9020
@@ -93,6 +95,7 @@ services:
     command: sh -c "sleep 8 && python client/client.py"
     restart: unless-stopped
     environment:
+      - HTTP_SERVER=true
       - DISCOVERY_SERVER=172.20.0.2:8000
       - IP_ADDRESS=10.10.0.30
       - PORT=9030

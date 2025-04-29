@@ -15,7 +15,8 @@ import atexit
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from common.pqxdh import PQXDHServer, PQXDHClient
 from common.aesgcm import decrypt_aes_gcm, encrypt_aes_gcm
-from tunnel import Tunnel  # Import the Tunnel class
+from tunnel import Tunnel
+from http_server import start_http_server
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
@@ -142,6 +143,12 @@ class MeshVPNClient:
             logger.info(
                 f"Using interface name from environment: {default_config['interface']}"
             )
+        if "HTTP_SERVER" in os.environ:
+            if os.environ["HTTP_SERVER"] == "true":
+                logger.info("Starting HTTP server on port 8080")
+                threading.Thread(
+                    target=start_http_server, args=(self, 8080), daemon=True
+                ).start()
 
         return default_config
 
