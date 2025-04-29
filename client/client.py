@@ -80,6 +80,15 @@ def print_banner():
 class MeshVPNClient:
     def __init__(self, config_path=None):
         self.node_id = str(uuid.uuid4())
+        self.identity_key = Ed448PrivateKey.generate()  # Generate the identity key
+        
+        # Generate and serialize the public key
+        self.public_key = self.identity_key.public_key()
+        self.public_key_bytes = self.public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+
         self.peers = {}
         self.connections = {}
         self.running = False
@@ -349,6 +358,7 @@ class MeshVPNClient:
 
             key_exchange = {
                 "node_id": self.node_id,
+                "identity_public": public_key_bytes.hex(),
                 "classical_public": keys["classical_public"].hex(),
                 "pq_public": keys["pq_public"].hex(),
             }
