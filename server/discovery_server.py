@@ -95,25 +95,36 @@ class DiscoveryServer:
             # Parse registration data
             try:
                 registration = json.loads(data.decode().strip())
-                # Modify the registration logging to truncate the public keys to the first 8 characters
-                logger.info(f"Registration from {address}: {{'node_id': '{registration['node_id']}', 'listen_port': {registration['listen_port']}, 'classical_public': '{registration['classical_public'][:8]}', 'pq_public': '{registration['pq_public'][:8]}'}}")
+                logger.info(
+                    f"Registration from {address}: {{'node_id': '{registration['node_id']}', 'ip_address': {registration['ip_address']}, 'listen_port': {registration['listen_port']}, 'classical_public': '{registration['classical_public'][:8]}', 'pq_public': '{registration['pq_public'][:8]}'}}"
+                )
             except json.JSONDecodeError:
                 logger.warning(f"Invalid JSON received from {address}")
                 client_socket.close()
                 return
 
             # Verify required fields
-            if "node_id" not in registration or "listen_port" not in registration or "classical_public" not in registration or "pq_public" not in registration:
-                logger.warning(f"Invalid registration from {address}")
+            if (
+                "node_id" not in registration
+                or "listen_port" not in registration
+                or "classical_public" not in registration
+                or "pq_public" not in registration
+                or "ip_address" not in registration
+            ):
+                logger.warning(
+                    f"Invalid registration from {address} - missing required fields"
+                )
                 client_socket.close()
                 return
 
-            # Perform PQXDH key exchange
+                # Perform PQXDH key exchange
             server = PQXDHServer()
             server_keys = server.generate_keys()
 
             try:
-                client_classical_public = bytes.fromhex(registration["classical_public"])
+                client_classical_public = bytes.fromhex(
+                    registration["classical_public"]
+                )
                 client_pq_public = bytes.fromhex(registration["pq_public"])
 
                 # Generate ciphertext for the client
@@ -127,7 +138,7 @@ class DiscoveryServer:
 
                 # Send length-prefixed JSON response
                 json_response = json.dumps(secure_response).encode()
-                length_prefix = len(json_response).to_bytes(4, byteorder='big')
+                length_prefix = len(json_response).to_bytes(4, byteorder="big")
                 client_socket.sendall(length_prefix + json_response)
 
                 # Store the shared secret for future communications with this peer
@@ -142,9 +153,13 @@ class DiscoveryServer:
                     for pid, pinfo in self.peers.items():
                         peer_list.append(pinfo)
 
-                encrypted_peer_list = encrypt_aes_gcm(shared_secret, json.dumps(peer_list).encode())
+                encrypted_peer_list = encrypt_aes_gcm(
+                    shared_secret, json.dumps(peer_list).encode()
+                )
                 client_socket.sendall(encrypted_peer_list)
-                logger.info(f"Sent peer list with {len(peer_list)} peers to {registration['node_id']}")
+                logger.info(
+                    f"Sent peer list with {len(peer_list)} peers to {registration['node_id']}"
+                )
                 logger.debug(f"Sending peer list: {peer_list}")
 
             except Exception as e:
@@ -157,18 +172,22 @@ class DiscoveryServer:
             peer_info = {
                 "node_id": peer_id,
                 "host": address[0],
+                "ip_address": registration["ip_address"],
                 "listen_port": registration["listen_port"],
                 "last_seen": time.time(),
             }
 
             with self.lock:
                 self.peers[peer_id] = peer_info
-                logger.info(f"Registered peer {peer_id} at {address[0]}:{registration['listen_port']}")
+                logger.info(
+                    f"Registered peer {peer_id} at {address[0]}:{registration['listen_port']} with VPN IP {registration['ip_address']}"
+                )
                 logger.debug(f"Registering peer: {peer_info}")
 
         except Exception as e:
             logger.error(f"Error handling client {address}: {e}")
             import traceback
+
             logger.error(traceback.format_exc())
         finally:
             client_socket.close()

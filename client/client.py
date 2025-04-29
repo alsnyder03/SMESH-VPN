@@ -15,11 +15,12 @@ import atexit
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 from common.pqxdh import PQXDHServer, PQXDHClient
 from common.aesgcm import decrypt_aes_gcm, encrypt_aes_gcm
-from tunnel import Tunnel  # Import the Tunnel class
+from tunnel import Tunnel
+from http_server import start_http_server
 
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
-from ipaddress import ip_address, IPv4Network
+from ipaddress import IPv4Address, IPv4Network
 from cryptography.hazmat.primitives.asymmetric.ed448 import (
     Ed448PrivateKey,
     Ed448PublicKey,
@@ -103,14 +104,14 @@ class MeshVPNClient:
             "discovery_servers": ["127.0.0.1:8000"],
             "interface": "smesh_tun0",
             "subnet": IPv4Network("10.10.0.0/24"),
-            "local_ip": ip_address("10.10.0.1"),
+            "local_ip": IPv4Address("10.10.0.1"),
             "keepalive_interval": 15,
         }
 
         # Override with command line arguments
         if args.ip:
             print(f"IP address from command line: {args.ip}")
-            ip = ip_address(args.ip)
+            ip = IPv4Address(args.ip)
             if ip in default_config["subnet"]:
                 default_config["local_ip"] = ip
         if args.port:
@@ -142,7 +143,7 @@ class MeshVPNClient:
             default_config["listen_port"] = int(os.environ["PORT"])
             logger.info(f"Using port from environment: {default_config['listen_port']}")
         if "IP_ADDRESS" in os.environ:
-            ip = ip_address(os.environ["IP_ADDRESS"])
+            ip = IPv4Address(os.environ["IP_ADDRESS"])
             if ip in default_config["subnet"]:
                 default_config["local_ip"] = ip
                 logger.info(f"Using IP from environment: {default_config['local_ip']}")
@@ -151,6 +152,12 @@ class MeshVPNClient:
             logger.info(
                 f"Using interface name from environment: {default_config['interface']}"
             )
+        if "HTTP_SERVER" in os.environ:
+            if os.environ["HTTP_SERVER"] == "true":
+                logger.info("Starting HTTP server on port 8080")
+                threading.Thread(
+                    target=start_http_server, args=(self, 8080), daemon=True
+                ).start()
 
         return default_config
 
@@ -165,6 +172,7 @@ class MeshVPNClient:
                 # Register with discovery server
                 registration = {
                     "node_id": self.node_id,
+                    "ip_address": str(self.config["local_ip"]),
                     "listen_port": self.config["listen_port"],
                     "classical_public": keys["classical_public"].hex(),
                     "pq_public": keys["pq_public"].hex(),
@@ -211,7 +219,6 @@ class MeshVPNClient:
                     try:
                         client.exchange(server_classical_public, server_ciphertext)
                         shared_secret = client.shared_secret
-                        # logger.info(f"Derived shared secret with discovery server: {shared_secret.hex()}")
                         break
                     except Exception as e:
                         logger.warning(
@@ -239,9 +246,8 @@ class MeshVPNClient:
                 # Process the peer list
                 if isinstance(peer_list, list):
                     for peer in peer_list:
-                        if (
-                            peer["node_id"] != self.node_id
-                        ):  # Exclude self from peer list
+                        # Check if the peer is not self
+                        if peer["node_id"] != self.node_id:
                             self.peers[peer["node_id"]] = peer
                         else:
                             logger.debug(f"Excluded self from peer list: {peer}")
@@ -274,6 +280,7 @@ class MeshVPNClient:
                 logger.info(
                     f"Virtual interface {self.config['interface']} set up via Tunnel class."
                 )
+                self.tunnel.start()  # Start the tunnel after setup
             else:
                 logger.error(
                     f"Failed to set up virtual interface {self.config['interface']} via Tunnel class."
@@ -321,25 +328,29 @@ class MeshVPNClient:
         connection = {
             "socket": s,
             "last_seen": current_time,
-            "last_sent": current_time,  # Track when we last sent data
             "last_received": current_time,  # Track when we last received data
-            "encrypt_thread": None,
+            "keepalive_thread": None,
             "decrypt_thread": None,
             "key": key,
         }
 
         self.connections[peer_id] = connection
 
+        # Get peer IP information from peers dictionary if available
+        peer_info = self.peers.get(peer_id, {})
+
+        self.register_ip_callbacks(peer_id, peer_info)
+
         # Start connection handling threads
-        connection["encrypt_thread"] = threading.Thread(
-            target=self.handle_outgoing_traffic, args=(peer_id,), daemon=True
+        connection["keepalive_thread"] = threading.Thread(
+            target=self.keepalive_loop, args=(peer_id,), daemon=True
         )
 
         connection["decrypt_thread"] = threading.Thread(
             target=self.handle_incoming_traffic, args=(peer_id,), daemon=True
         )
 
-        connection["encrypt_thread"].start()
+        connection["keepalive_thread"].start()
         connection["decrypt_thread"].start()
 
         logger.info(f"Connected to peer {peer_id}")
@@ -361,6 +372,7 @@ class MeshVPNClient:
                 "identity_public": public_key_bytes.hex(),
                 "classical_public": keys["classical_public"].hex(),
                 "pq_public": keys["pq_public"].hex(),
+                "ip_address": self.config["local_ip"].compressed,
             }
 
             logger.debug(f"Key exchange data: {key_exchange}")
@@ -395,10 +407,18 @@ class MeshVPNClient:
 
             if "node_id" in handshake:
                 peer_id = handshake["node_id"]
+                peer_ip = handshake["ip_address"]
+
                 ciphertext = server.exchange(
                     bytes.fromhex(handshake["classical_public"]),
                     bytes.fromhex(handshake["pq_public"]),
                 )
+
+                # add ip address to peer info
+                if peer_id not in self.peers:
+                    self.peers[peer_id] = {
+                        "ip_address": peer_ip,
+                    }
 
                 key_exchange = {
                     "node_id": self.node_id,
@@ -415,107 +435,6 @@ class MeshVPNClient:
         except Exception as e:
             logger.error(f"Error handling new connection: {e}")
             client_socket.close()
-
-    def handle_outgoing_traffic(self, peer_id: str):
-        """Handle traffic going out to the peer using the Tunnel."""
-        connection = self.connections.get(peer_id)
-        if not connection:
-            return
-
-        sock = connection["socket"]
-        key = connection["key"]
-
-        if not self.tunnel:
-            logger.error("Tunnel not initialized for outgoing traffic.")
-            return
-
-        try:
-            while self.running and peer_id in self.connections:
-                try:
-                    # Use the tunnel's read() method directly - it already handles non-blocking I/O
-                    packet = self.tunnel.read(
-                        4096
-                    )  # Using default MTU if not specified
-
-                    if not packet:
-                        # No data available, sleep briefly to prevent CPU hogging
-                        time.sleep(0.01)
-                        # Check connection status
-                        if peer_id not in self.connections:
-                            break
-                        continue
-
-                    # Check connection status before encrypting/sending
-                    if peer_id not in self.connections:
-                        break
-
-                    logger.debug(f"Read {len(packet)} bytes from tunnel for {peer_id}")
-
-                    # Encrypt and send the packet
-                    encrypted_data = encrypt_aes_gcm(key, packet)
-                    packet_length = len(encrypted_data).to_bytes(4, byteorder="big")
-
-                    # Check connection status one last time before sending
-                    if peer_id not in self.connections:
-                        break
-
-                    sock.sendall(packet_length + encrypted_data)
-                    # Update activity timestamps - specifically tracking when WE sent data
-                    current_time = time.time()
-                    connection["last_sent"] = (
-                        current_time  # Explicitly track when we sent data
-                    )
-                    connection["last_seen"] = current_time
-
-                    logger.debug(f"Read {len(packet)} bytes from tunnel for {peer_id}")
-
-                except OSError as e:
-                    # Check connection status before logging/removing
-                    if peer_id in self.connections:
-                        if e.errno == 9:  # Bad file descriptor
-                            logger.warning(
-                                f"Tunnel or socket for peer {peer_id} closed unexpectedly (errno 9) in outgoing handler. Connection likely removed."
-                            )
-                        elif (
-                            e.errno == 10038
-                        ):  # An operation was attempted on something that is not a socket (Windows)
-                            logger.warning(
-                                f"Socket for peer {peer_id} closed unexpectedly (errno 10038) in outgoing handler. Connection likely removed."
-                            )
-                        elif (
-                            e.errno == 10053
-                        ):  # An established connection was aborted by the software in your host machine (Windows)
-                            logger.warning(
-                                f"Connection aborted for peer {peer_id} (errno 10053) in outgoing handler."
-                            )
-                        elif e.errno == 10054:  # Connection reset by peer (Windows)
-                            logger.warning(
-                                f"Connection reset by peer {peer_id} (errno 10054) in outgoing handler."
-                            )
-                        else:
-                            logger.error(f"Tunnel I/O error for peer {peer_id}: {e}")
-                        self.remove_connection(peer_id)  # Attempt removal
-                    break  # Exit loop on error
-                except Exception as e:
-                    # Check connection status before logging/removing
-                    if peer_id in self.connections:
-                        logger.error(f"Error sending data to peer {peer_id}: {e}")
-                        import traceback
-
-                        logger.error(traceback.format_exc())
-                        self.remove_connection(peer_id)
-                    break  # Exit loop on error
-        except Exception as e:
-            # Catch potential errors if connection is removed mid-operation
-            if peer_id in self.connections:
-                logger.error(
-                    f"Unhandled error in outgoing traffic handler for {peer_id}: {e}"
-                )
-                import traceback
-
-                logger.error(traceback.format_exc())
-                self.remove_connection(peer_id)
-            # else: Connection already removed, suppress error
 
     def handle_incoming_traffic(self, peer_id: str):
         """Handle incoming traffic from a specific peer."""
@@ -591,7 +510,7 @@ class MeshVPNClient:
                                     len(packet) > 0
                                     and packet[0] == PACKET_TYPE_KEEPALIVE
                                 ):
-                                    logger.info(
+                                    logger.debug(
                                         f"Received keepalive packet from peer {peer_id}"
                                     )
                                     continue  # Skip further processing for keepalives
@@ -710,58 +629,102 @@ class MeshVPNClient:
             # Format: 1-byte packet type (1 for keepalive)
             keepalive_packet = struct.pack("!B", PACKET_TYPE_KEEPALIVE)
 
-            # Encrypt the keepalive packet
-            iv = os.urandom(16)  # Generate a fresh IV
-            encryptor = Cipher(
-                algorithms.AES(key), modes.GCM(iv), backend=default_backend()
-            ).encryptor()
-            ciphertext = encryptor.update(keepalive_packet) + encryptor.finalize()
-            encrypted_data = iv + encryptor.tag + ciphertext  # Prepend IV and tag
+            # Encrypt the keepalive packet using the common utility function
+            encrypted_data = encrypt_aes_gcm(key, keepalive_packet)
 
             # Send the packet with its length prefix
             packet_length = len(encrypted_data).to_bytes(4, byteorder="big")
             sock.sendall(packet_length + encrypted_data)
 
-            # Update timestamps when sending keepalive
-            current_time = time.time()
-            connection["last_sent"] = (
-                current_time  # Explicitly track when we sent keepalive
-            )
-            connection["last_seen"] = current_time
-
-            logger.info(f"Sent keepalive packet to peer {peer_id}")
+            logger.debug(f"Sent keepalive packet to peer {peer_id}")
             return True
         except Exception as e:
             logger.error(f"Error sending keepalive to peer {peer_id}: {e}")
             self.remove_connection(peer_id)
             return False
 
-    def check_and_send_keepalives(self):
-        """Check all connections and send keepalives if needed"""
-        current_time = time.time()
+    def register_ip_callbacks(self, peer_id: str, peer_info):
+        """
+        Register IP-specific callbacks for a peer.
+        This allows packets to be routed directly to the correct peer based on destination IP.
+        """
+        if not self.tunnel:
+            logger.error("Cannot register IP callbacks - tunnel not initialized")
+            return False
 
-        # Only check every few seconds to avoid excessive processing
-        if current_time - self.last_keepalive_check < 5:
-            return
+        # Get the peer's IP address from the peer info
+        peer_ip = peer_info["ip_address"]
+        logger.info(f"Using IP address {peer_ip} for peer {peer_id}")
 
-        self.last_keepalive_check = current_time
+        # First, clear any existing callback for this IP to prevent duplicates
+        self.tunnel.unregister_packet_callback(peer_ip)
 
-        for peer_id in list(self.connections.keys()):
+        # Create a callback function that will handle packets for this specific IP
+        def ip_packet_handler(packet: bytes):
             try:
+                # Get the connection details
                 connection = self.connections.get(peer_id)
                 if not connection:
-                    continue
+                    logger.warning(
+                        f"Attempted to route packet to peer {peer_id} but connection doesn't exist"
+                    )
+                    # TODO handle this case more gracefully, maybe try to reconnect or something
+                    return
 
-                # Send keepalive if no outgoing data sent for half the keepalive interval
-                # regardless of whether we've received data
-                if (
-                    current_time - connection.get("last_sent", 0)
-                    > self.config["keepalive_interval"] / 2
-                ):
-                    self.send_keepalive(peer_id)
+                sock = connection["socket"]
+                key = connection["key"]
+
+                # Encrypt and send the packet
+                encrypted_data = encrypt_aes_gcm(key, packet)
+                packet_length = len(encrypted_data).to_bytes(4, byteorder="big")
+
+                # Send the encrypted packet
+                sock.sendall(packet_length + encrypted_data)
+
+                # Update activity timestamps
+                current_time = time.time()
+                connection["last_seen"] = current_time
+
+                logger.debug(
+                    f"Routed packet of {len(packet)} bytes to peer {peer_id} for IP {peer_ip}"
+                )
             except Exception as e:
-                logger.error(f"Error in keepalive check for peer {peer_id}: {e}")
-                # Don't remove connection here, let the normal error handling handle it
+                logger.error(f"Error routing packet to peer {peer_id}: {e}")
+                import traceback
+
+                logger.error(traceback.format_exc())
+
+        # Register the callback for this specific IP
+        self.tunnel.register_packet_callback(peer_ip, ip_packet_handler)
+        logger.info(f"Registered IP-based routing for {peer_ip} to peer {peer_id}")
+
+        # Log all registered callbacks for debugging
+        logger.info(
+            f"Current registered callbacks: {list(self.tunnel.packet_callbacks.keys())}"
+        )
+        return True
+
+    def keepalive_loop(self, peer_id: str):
+        """
+        Dedicated thread to send periodic keepalives to a peer every 45 seconds.
+        This replaces the old handle_outgoing_traffic polling approach.
+        """
+        try:
+            while self.running and peer_id in self.connections:
+                # Send the keepalive
+                self.send_keepalive(peer_id)
+
+                # Sleep for 45 seconds before sending the next one
+                # Using a series of short sleeps to check if we're still running
+                for _ in range(45):
+                    if not self.running or peer_id not in self.connections:
+                        break
+                    time.sleep(1)
+
+        except Exception as e:
+            logger.error(f"Error in keepalive loop for peer {peer_id}: {e}")
+            if peer_id in self.connections:
+                self.remove_connection(peer_id)
 
     def start(self):
         """Start the VPN client"""
@@ -805,7 +768,7 @@ class MeshVPNClient:
                     if not conn:
                         continue
 
-                    # Reconnect if needed - use last_sent_or_received instead of last_seen
+                    # Reconnect if needed based on last received data
                     if (
                         time.time() - conn["last_received"]
                         > self.config["keepalive_interval"] * 3
@@ -814,9 +777,6 @@ class MeshVPNClient:
                         self.remove_connection(peer_id)
                         if peer_id in self.peers:
                             self.connect_to_peer(peer_id, self.peers[peer_id])
-
-                # Check and send keepalives
-                self.check_and_send_keepalives()
 
                 time.sleep(1)
         except KeyboardInterrupt:
@@ -829,6 +789,10 @@ class MeshVPNClient:
 
     def stop(self):
         """Stop the VPN client"""
+        if not self.running:
+            logger.info("VPN client is already stopped.")
+            return
+
         logger.info("Stopping VPN client...")
         self.running = False
 
@@ -847,6 +811,7 @@ class MeshVPNClient:
         # Close the Tunnel device
         if self.tunnel:
             try:
+                self.tunnel.stop()
                 self.tunnel.close()
                 logger.info("Closed TUN device via Tunnel class.")
             except Exception as e:

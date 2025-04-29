@@ -92,7 +92,7 @@ class Tunnel:
         """Set up TUN device on Linux"""
         try:
             import fcntl  # Linux/Unix specific
-            import time   # Import time for delays
+            import time  # Import time for delays
 
             # Constants from Linux headers
             TUNSETIFF = 0x400454CA
@@ -106,11 +106,13 @@ class Tunnel:
                     ["ip", "link", "show", "dev", self.interface_name],
                     check=False,
                     stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE
+                    stderr=subprocess.PIPE,
                 )
-                
+
                 if result.returncode == 0:
-                    logger.info(f"Interface {self.interface_name} already exists, cleaning up...")
+                    logger.info(
+                        f"Interface {self.interface_name} already exists, cleaning up..."
+                    )
                     # Interface exists, bring it down first
                     subprocess.run(
                         ["ip", "link", "set", "dev", self.interface_name, "down"],
@@ -119,7 +121,15 @@ class Tunnel:
                     )
                     # Delete the existing interface
                     subprocess.run(
-                        ["ip", "tuntap", "del", "dev", self.interface_name, "mode", "tun"],
+                        [
+                            "ip",
+                            "tuntap",
+                            "del",
+                            "dev",
+                            self.interface_name,
+                            "mode",
+                            "tun",
+                        ],
                         check=False,
                         stderr=subprocess.DEVNULL,
                     )
@@ -173,7 +183,7 @@ class Tunnel:
                     check=False,  # Don't fail if route doesn't exist
                     stderr=subprocess.DEVNULL,
                 )
-                
+
                 # Add the new route
                 subprocess.run(
                     ["ip", "route", "add", subnet, "dev", self.interface_name],
@@ -655,6 +665,7 @@ class Tunnel:
         and calls appropriate callbacks based on the destination IP.
         """
         logger.info("Starting packet reader loop")
+        logger.info(f"Registered callbacks: {list(self.packet_callbacks.keys())}")
 
         while self.running and self.tun_fd is not None:
             try:
@@ -675,22 +686,30 @@ class Tunnel:
                 # Destination IP is at bytes 16-19
                 dst_ip = socket.inet_ntoa(packet[16:20])
                 src_ip = socket.inet_ntoa(packet[12:16])
+                logger.info(f"Received packet from {src_ip} to {dst_ip}")
 
-                # Check if this is a packet from our subnet
+                # Check if this is a packet for our subnet
                 if IPv4Address(dst_ip) in self.subnet:
                     # Call the general packet handler if registered
                     if self.packet_handler:
+                        logger.debug(
+                            f"Calling general packet handler for packet to {dst_ip}"
+                        )
                         self.packet_handler(packet, dst_ip)
 
                     # Call the specific callback for this destination IP if registered
                     if dst_ip in self.packet_callbacks:
                         try:
+                            logger.debug(f"Calling specific callback for {dst_ip}")
                             self.packet_callbacks[dst_ip](packet)
                         except Exception as e:
                             logger.error(f"Error in packet callback for {dst_ip}: {e}")
+                            import traceback
+
+                            logger.error(traceback.format_exc())
                     else:
-                        logger.debug(
-                            f"No callback registered for destination IP: {dst_ip}"
+                        logger.info(
+                            f"No callback registered for destination IP: {dst_ip}, available callbacks: {list(self.packet_callbacks.keys())}"
                         )
 
             except Exception as e:
@@ -719,7 +738,9 @@ class Tunnel:
                 except BlockingIOError as e:
                     # This happens with non-blocking I/O when no data is available
                     # It's not an error, just return None to indicate no data
-                    if e.errno == 11:  # Resource temporarily unavailable (EAGAIN/EWOULDBLOCK)
+                    if (
+                        e.errno == 11
+                    ):  # Resource temporarily unavailable (EAGAIN/EWOULDBLOCK)
                         return None
                     else:
                         # For other BlockingIOError types, log but don't close the TUN
@@ -733,7 +754,9 @@ class Tunnel:
                 logger.error(f"Bad file descriptor error reading from TUN device: {e}")
                 self.close()  # Attempt to clean up
             else:
-                logger.warning(f"OSError reading from TUN device: {e}, continuing operation")
+                logger.warning(
+                    f"OSError reading from TUN device: {e}, continuing operation"
+                )
             return None
         except Exception as e:
             logger.error(f"Unexpected error reading from TUN device: {e}")
