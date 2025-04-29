@@ -34,7 +34,7 @@ services:
       - net.ipv4.ip_forward=1 # Enable IP forwarding
     devices:
       - /dev/net/tun:/dev/net/tun
-    command: sh -c "sleep 2 && python client/client.py"
+    command: sh -c "python client/client.py"
     restart: unless-stopped
     environment:
       - HTTP_SERVER=true
@@ -63,7 +63,7 @@ services:
       - net.ipv4.ip_forward=1 # Enable IP forwarding
     devices:
       - /dev/net/tun:/dev/net/tun
-    command: sh -c "sleep 5 && python client/client.py"
+    command: sh -c "python client/client.py"
     restart: unless-stopped
     environment:
       - HTTP_SERVER=true
@@ -92,7 +92,7 @@ services:
       - net.ipv4.ip_forward=1 # Enable IP forwarding
     devices:
       - /dev/net/tun:/dev/net/tun
-    command: sh -c "sleep 8 && python client/client.py"
+    command: sh -c "python client/client.py"
     restart: unless-stopped
     environment:
       - HTTP_SERVER=true

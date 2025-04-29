@@ -29,7 +29,7 @@ def start_http_server(vpn_client, port=8080):
                     f"VPN IP: {vpn_client.config['local_ip']}\n"
                     f"Interface: {vpn_client.config['interface']}\n"
                     f"Connected peers: {active_connections}\n\n"
-                    f"Known peers:\n" + "\n".join(f"- {p}" for p in peers_info)
+                    f"Known peers:\n" + "\n".join(f"- {p}" for p in peers_info) + "\n\n"
                 )
 
                 self.wfile.write(response.encode())

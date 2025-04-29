@@ -82,12 +82,11 @@ class MeshVPNClient:
     def __init__(self, config_path=None):
         self.node_id = str(uuid.uuid4())
         self.identity_key = Ed448PrivateKey.generate()  # Generate the identity key
-        
+
         # Generate and serialize the public key
         self.public_key = self.identity_key.public_key()
         self.public_key_bytes = self.public_key.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
+            encoding=serialization.Encoding.Raw, format=serialization.PublicFormat.Raw
         )
 
         self.peers = {}
@@ -369,7 +368,7 @@ class MeshVPNClient:
 
             key_exchange = {
                 "node_id": self.node_id,
-                "identity_public": public_key_bytes.hex(),
+                "identity_public": self.public_key_bytes.hex(),
                 "classical_public": keys["classical_public"].hex(),
                 "pq_public": keys["pq_public"].hex(),
                 "ip_address": self.config["local_ip"].compressed,
@@ -524,20 +523,6 @@ class MeshVPNClient:
                                     f"Decryption error for peer {peer_id}: {e}"
                                 )
                                 # Continue processing other packets
-                            except OSError as e:
-                                if peer_id in self.connections:
-                                    if (
-                                        e.errno == 9
-                                    ):  # Bad file descriptor (tunnel closed?)
-                                        logger.warning(
-                                            f"Tunnel write error (errno 9) for peer {peer_id}."
-                                        )
-                                    else:
-                                        logger.error(
-                                            f"Tunnel write error for peer {peer_id}: {e}"
-                                        )
-                                    self.remove_connection(peer_id)
-                                break
                             except Exception as e:
                                 if peer_id in self.connections:
                                     logger.error(
@@ -558,30 +543,6 @@ class MeshVPNClient:
                 except ConnectionResetError:
                     if peer_id in self.connections:
                         logger.warning(f"Connection reset by peer {peer_id}.")
-                        self.remove_connection(peer_id)
-                    break
-                except OSError as e:
-                    if peer_id in self.connections:
-                        if e.errno == 9:  # Bad file descriptor
-                            logger.warning(
-                                f"Socket for peer {peer_id} closed unexpectedly (errno 9)."
-                            )
-                        elif e.errno == 10038:  # Not a socket (Windows)
-                            logger.warning(
-                                f"Socket for peer {peer_id} closed unexpectedly (errno 10038)."
-                            )
-                        elif e.errno == 10053:  # Connection aborted (Windows)
-                            logger.warning(
-                                f"Connection aborted for peer {peer_id} (errno 10053)."
-                            )
-                        elif e.errno == 10054:  # Connection reset by peer (Windows)
-                            logger.warning(
-                                f"Connection reset by peer {peer_id} (errno 10054)."
-                            )
-                        else:
-                            logger.error(
-                                f"Error receiving data from peer {peer_id}: {e}"
-                            )
                         self.remove_connection(peer_id)
                     break
                 except Exception as e:

@@ -7,7 +7,7 @@ import threading
 import time
 import socket
 import struct
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict
 from ipaddress import ip_address, IPv4Network, IPv4Address
 import select  # Added for non-blocking read
 
@@ -16,9 +16,8 @@ logger = logging.getLogger(__name__)
 
 class Tunnel:
     """
-    A cross-platform abstraction for TUN/TAP devices.
-    This class provides a unified interface for creating and managing tunnels
-    across different operating systems.
+    A Linux TUN device abstraction.
+    This class provides an interface for creating and managing tunnels.
     """
 
     def __init__(
@@ -41,13 +40,11 @@ class Tunnel:
         self.interface_name = interface_name
         self.local_ip = local_ip
         self.prefix_len = prefix_len
-        self.tun_fd = None  # File descriptor or socket
+        self.tun_fd = None  # File descriptor
         self.running = False
-        self.os_name = platform.system().lower()
         self.read_lock = threading.Lock()
         self.write_lock = threading.Lock()
         self.packet_handler = packet_handler
-        self.tunnel_port = 0  # Used for Windows socket proxy
         self.reader_thread = None
         self.packet_callbacks: Dict[str, Callable[[bytes], None]] = {}
         self.subnet = IPv4Network(f"{local_ip}/{prefix_len}", strict=False)
@@ -64,23 +61,10 @@ class Tunnel:
         self.cleanup()
 
     def setup(self) -> bool:
-        """
-        Set up the tunnel interface based on the current platform.
-
-        Returns:
-            bool: True if setup was successful, False otherwise
-        """
-        logger.info(f"Setting up tunnel for platform: {self.os_name}")
+        """Set up the tunnel interface for Linux"""
+        logger.info("Setting up tunnel interface")
         try:
-            if self.os_name == "linux":
-                return self._setup_linux()
-            elif self.os_name == "windows":
-                return self._setup_windows()
-            elif self.os_name == "darwin":  # macOS
-                return self._setup_macos()
-            else:
-                logger.error(f"Unsupported platform: {self.os_name}")
-                return False
+            return self._setup_linux()
         except Exception as e:
             logger.error(f"Error setting up tunnel: {e}")
             import traceback
@@ -170,7 +154,6 @@ class Tunnel:
             )
 
             # Add explicit route for the subnet through the tunnel interface
-            # This ensures proper routing between VPN clients
             try:
                 # Extract subnet from the local IP and prefix length
                 ip_obj = ip_address(self.local_ip)
@@ -205,22 +188,8 @@ class Tunnel:
                     check=True,
                     capture_output=True,
                 )
-                logger.info(
-                    f"Disabled IPv6 autoconfiguration for {self.interface_name}"
-                )
-            except FileNotFoundError:
-                logger.warning(
-                    "'sysctl' command not found. Cannot disable IPv6 autoconf automatically."
-                )
-            except subprocess.CalledProcessError as e:
-                # This might fail if IPv6 is disabled globally or the module isn't loaded
-                logger.warning(
-                    f"Could not disable IPv6 autoconf for {self.interface_name} (might be normal): {e.stderr.decode().strip()}"
-                )
-            except Exception as e_sysctl:
-                logger.warning(
-                    f"An unexpected error occurred disabling IPv6 autoconf: {e_sysctl}"
-                )
+            except Exception:
+                pass  # Ignore IPv6 configuration errors
 
             # Set to non-blocking mode
             flags = fcntl.fcntl(self.tun_fd, fcntl.F_GETFL)
@@ -230,202 +199,8 @@ class Tunnel:
                 f"Linux TUN device '{self.interface_name}' set up with IP {self.local_ip}/{self.prefix_len}"
             )
             return True
-        except ImportError:
-            logger.error("'fcntl' module not found. Cannot set up TUN on this system.")
-            return False
-        except FileNotFoundError:
-            logger.error(
-                "'ip' command not found or /dev/net/tun does not exist. Is the 'tuntap' module loaded?"
-            )
-            return False
-        except PermissionError:
-            logger.error(
-                "Permission denied. Run as root or with CAP_NET_ADMIN capability."
-            )
-            return False
         except Exception as e:
             logger.error(f"Failed to set up Linux TUN device: {e}")
-            if self.tun_fd is not None:
-                os.close(self.tun_fd)
-                self.tun_fd = None
-            return False
-
-    def _setup_windows(self) -> bool:
-        """Set up a socket-based proxy tunnel on Windows."""
-        logger.info("Windows detected. Creating a socket-based proxy tunnel.")
-        # Note: This doesn't create a real network interface visible to the OS.
-        # It relies on the application routing packets correctly.
-        # For a real interface, OpenVPN TAP or WinTUN drivers are needed.
-        try:
-            # Create a UDP socket to act as the tunnel endpoint
-            server = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            server.bind(("127.0.0.1", 0))  # Bind to localhost on an available port
-            self.tunnel_port = server.getsockname()[1]
-            server.setblocking(False)  # Set to non-blocking
-
-            # Store the socket as our "file descriptor"
-            self.tun_fd = server
-
-            logger.info(
-                f"Created proxy tunnel on Windows using UDP socket 127.0.0.1:{self.tunnel_port}"
-            )
-            logger.info(
-                f"Application treats this as interface '{self.interface_name}' with IP {self.local_ip}/{self.prefix_len}"
-            )
-            logger.warning(
-                "Windows proxy tunnel does not create a system-wide interface."
-            )
-            logger.warning(
-                "Routing must be handled within the application or manually."
-            )
-
-            # Attempt to add a route (requires admin privileges)
-            self._setup_windows_routing()
-
-            return True
-        except Exception as e:
-            logger.error(f"Failed to set up Windows TUN proxy: {e}")
-            if self.tun_fd is not None:
-                self.tun_fd.close()
-                self.tun_fd = None
-            return False
-
-    def _setup_windows_routing(self):
-        """Attempt to set up routing on Windows (requires admin)."""
-        # This is a best-effort attempt and might fail if not run as admin.
-        # The subnet 10.10.0.0/24 is hardcoded here, should ideally be configurable.
-        subnet_addr = "10.10.0.0"
-        subnet_mask = "255.255.255.0"
-        logger.info(
-            f"Attempting to add route for {subnet_addr}/{subnet_mask} via {self.local_ip}"
-        )
-        try:
-            # Delete existing route first, ignore errors
-            subprocess.run(
-                ["route", "delete", subnet_addr], check=False, capture_output=True
-            )
-            # Add the new route
-            result = subprocess.run(
-                ["route", "add", subnet_addr, "MASK", subnet_mask, self.local_ip],
-                check=True,
-                capture_output=True,
-                text=True,
-            )
-            logger.info("Route added successfully (requires admin privileges).")
-            logger.debug(f"Route command output: {result.stdout}")
-        except FileNotFoundError:
-            logger.warning(
-                "'route' command not found. Cannot set up routing automatically."
-            )
-        except subprocess.CalledProcessError as e:
-            logger.warning(f"Failed to add route (may require admin privileges): {e}")
-            logger.warning(f"Route command error output: {e.stderr}")
-        except Exception as e:
-            logger.warning(
-                f"An unexpected error occurred while setting up routing: {e}"
-            )
-
-    def _setup_macos(self) -> bool:
-        """Set up TUN device on macOS"""
-        logger.info("macOS detected. Setting up TUN interface.")
-        # Requires TUN/TAP driver (e.g., tuntaposx) to be installed.
-        try:
-            # Check for TUN/TAP driver (simple check, might not be foolproof)
-            if not any(f.startswith("utun") for f in os.listdir("/dev")):
-                logger.warning(
-                    "No /dev/utun* devices found. TUN/TAP driver might be missing."
-                )
-                # Attempt to load kext, might require user interaction or sudo
-                try:
-                    subprocess.run(
-                        ["sudo", "kextload", "/Library/Extensions/tun.kext"],
-                        check=True,
-                        capture_output=True,
-                    )
-                    subprocess.run(
-                        ["sudo", "kextload", "/Library/Extensions/tap.kext"],
-                        check=True,
-                        capture_output=True,
-                    )
-                    logger.info("Attempted to load tun/tap kexts.")
-                except Exception as kext_e:
-                    logger.warning(
-                        f"Could not load kexts: {kext_e}. Please install TUN/TAP driver (e.g., tuntaposx). Manual loading might be needed."
-                    )
-                    # return False # Decide if you want to fail here or try anyway
-
-            # Find an available utun device
-            tun_device_path = None
-            for i in range(256):  # Check utun0 to utun255
-                path = f"/dev/utun{i}"
-                try:
-                    fd = os.open(path, os.O_RDWR)
-                    # Successfully opened, this is our device
-                    self.tun_fd = fd
-                    # Get the actual interface name assigned by the kernel
-                    # This requires more complex ioctl calls (SIOCGIFNAME) or parsing ifconfig output
-                    # For simplicity, we'll assume the name matches utun{i} for configuration
-                    # but this might not always be true if interfaces are renamed.
-                    # A more robust method involves socket ioctls.
-                    self.interface_name = (
-                        f"utun{i}"  # Update interface name based on opened device
-                    )
-                    tun_device_path = path
-                    logger.info(
-                        f"Opened TUN device: {path} as interface {self.interface_name}"
-                    )
-                    break
-                except OSError as e:
-                    if e.errno == 16:  # Device busy
-                        continue
-                    elif (
-                        e.errno == 2
-                    ):  # No such file or directory (shouldn't happen if driver is loaded)
-                        continue
-                    else:
-                        raise  # Re-raise other errors
-
-            if self.tun_fd is None:
-                logger.error("Could not find or open an available utun device.")
-                return False
-
-            # Configure the interface using ifconfig
-            subprocess.run(
-                ["ifconfig", self.interface_name, "inet", self.local_ip, self.local_ip],
-                check=True,
-            )
-            subprocess.run(
-                ["ifconfig", self.interface_name, "netmask", f"{self.prefix_len}"],
-                check=True,
-            )  # This might not be the correct way to set prefixlen on macOS
-            subprocess.run(["ifconfig", self.interface_name, "up"], check=True)
-
-            # Set non-blocking (less critical on macOS compared to Linux select/poll)
-            # import fcntl
-            # flags = fcntl.fcntl(self.tun_fd, fcntl.F_GETFL)
-            # fcntl.fcntl(self.tun_fd, fcntl.F_SETFL, flags | os.O_NONBLOCK)
-
-            logger.info(
-                f"macOS TUN device '{self.interface_name}' set up with IP {self.local_ip}"
-            )
-            return True
-        except FileNotFoundError:
-            logger.error("'ifconfig' command not found. Cannot configure interface.")
-            return False
-        except PermissionError:
-            logger.error(
-                "Permission denied. Run as root or with appropriate permissions."
-            )
-            return False
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Error configuring macOS interface: {e}")
-            logger.error(f"Command output: {e.stderr}")
-            if self.tun_fd is not None:
-                os.close(self.tun_fd)
-                self.tun_fd = None
-            return False
-        except Exception as e:
-            logger.error(f"Failed to set up macOS TUN device: {e}")
             if self.tun_fd is not None:
                 os.close(self.tun_fd)
                 self.tun_fd = None
@@ -457,15 +232,6 @@ class Tunnel:
 
         if self.reader_thread and self.reader_thread.is_alive():
             logger.info("Stopping packet reader thread...")
-            # For socket proxy, we might need to send a dummy packet to unblock recvfrom
-            if self.os_name == "windows" and self.tun_fd:
-                try:
-                    dummy_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    dummy_socket.sendto(b"stop", ("127.0.0.1", self.tunnel_port))
-                    dummy_socket.close()
-                except Exception as e:
-                    logger.warning(f"Could not send stop signal to Windows proxy: {e}")
-
             self.reader_thread.join(timeout=1)
             if self.reader_thread.is_alive():
                 logger.warning("Tunnel packet reader thread did not stop gracefully.")
@@ -474,165 +240,36 @@ class Tunnel:
         logger.info("Tunnel stopped")
 
     def cleanup(self):
-        """Clean up resources (close file descriptor/socket, remove interface)."""
+        """Clean up resources (close file descriptor, remove interface)."""
         logger.info(f"Cleaning up tunnel interface '{self.interface_name}'...")
         self.stop()
 
-        # Close the file descriptor or socket
+        # Close the file descriptor
         if self.tun_fd is not None:
             try:
-                if self.os_name == "windows":
-                    self.tun_fd.close()
-                else:
-                    os.close(self.tun_fd)
+                os.close(self.tun_fd)
                 self.tun_fd = None
-                logger.info("Tunnel descriptor/socket closed.")
+                logger.info("Tunnel descriptor closed.")
             except Exception as e:
-                logger.error(f"Error closing tunnel descriptor/socket: {e}")
+                logger.error(f"Error closing tunnel descriptor: {e}")
 
         # Clean up the interface configuration
         try:
-            if self.os_name == "linux":
-                subprocess.run(
-                    ["ip", "link", "set", "dev", self.interface_name, "down"],
-                    check=False,
-                    stderr=subprocess.DEVNULL,
-                )
-                subprocess.run(
-                    ["ip", "tuntap", "del", "dev", self.interface_name, "mode", "tun"],
-                    check=False,
-                    stderr=subprocess.DEVNULL,
-                )
-                logger.info(f"Linux interface '{self.interface_name}' removed.")
-            elif self.os_name == "darwin":
-                # Interface might be automatically destroyed when fd is closed,
-                # but explicitly bringing it down is good practice.
-                subprocess.run(
-                    ["ifconfig", self.interface_name, "down"],
-                    check=False,
-                    stderr=subprocess.DEVNULL,
-                )
-                # Deleting utun interfaces might not be standard practice or necessary
-                # os.system(f"ifconfig {self.interface_name} destroy")
-                logger.info(f"macOS interface '{self.interface_name}' brought down.")
-            elif self.os_name == "windows":
-                # Attempt to remove the route
-                try:
-                    subprocess.run(
-                        ["route", "delete", "10.10.0.0"],
-                        check=False,
-                        capture_output=True,
-                    )
-                    logger.info(
-                        "Attempted to remove route (requires admin privileges)."
-                    )
-                except Exception:
-                    logger.warning("Could not automatically remove route.")
+            subprocess.run(
+                ["ip", "link", "set", "dev", self.interface_name, "down"],
+                check=False,
+                stderr=subprocess.DEVNULL,
+            )
+            subprocess.run(
+                ["ip", "tuntap", "del", "dev", self.interface_name, "mode", "tun"],
+                check=False,
+                stderr=subprocess.DEVNULL,
+            )
+            logger.info(f"Linux interface '{self.interface_name}' removed.")
         except Exception as e:
             logger.error(f"Error during interface cleanup commands: {e}")
 
         logger.info(f"Tunnel interface '{self.interface_name}' cleanup complete.")
-
-    def read_packet(self, max_size=4096) -> Optional[bytes]:
-        """
-        Read a packet from the tunnel (non-blocking).
-
-        Args:
-            max_size: Maximum packet size to read.
-
-        Returns:
-            bytes or None: Packet data if available, None otherwise.
-        """
-        if not self.tun_fd or not self.running:
-            # logger.debug("Tunnel not ready or not running for reading.")
-            return None
-
-        with self.read_lock:
-            try:
-                if self.os_name == "windows":
-                    # Read from the UDP socket (Windows proxy)
-                    data, _ = self.tun_fd.recvfrom(max_size)
-                    # Ignore dummy stop packet
-                    if data == b"stop":
-                        return None
-                    return data
-                else:
-                    # Read from the TUN file descriptor (Linux/macOS)
-                    return os.read(self.tun_fd, max_size)
-            except BlockingIOError:
-                # This is expected when no data is available on non-blocking fd/socket
-                return None
-            except ConnectionResetError:  # Can happen on Windows socket
-                logger.warning(
-                    "ConnectionResetError during read (Windows socket closed?)."
-                )
-                self.stop()
-                return None
-            except OSError as e:
-                # Check for Bad File Descriptor (errno 9)
-                if e.errno == 9:
-                    logger.error(
-                        "Bad file descriptor during read. Tunnel may be closed."
-                    )
-                    self.tun_fd = None  # Mark as closed
-                    self.stop()
-                else:
-                    # Log other OS errors
-                    logger.error(f"OSError reading from tunnel: {e}")
-                return None
-            except Exception as e:
-                # Catch any other unexpected errors during read
-                logger.error(f"Unexpected error reading from tunnel: {e}")
-                self.stop()
-                return None
-
-    def write_packet(self, packet: bytes) -> bool:
-        """
-        Write a packet to the tunnel.
-
-        Args:
-            packet: Packet data to write.
-
-        Returns:
-            bool: True if write was successful, False otherwise.
-        """
-        if not self.tun_fd or not self.running:
-            logger.warning("Tunnel not ready or not running for writing.")
-            return False
-
-        with self.write_lock:
-            try:
-                if self.os_name == "windows":
-                    # Write to the UDP socket (Windows proxy)
-                    # Need a target address, send back to itself for the handler loop
-                    bytes_sent = self.tun_fd.sendto(
-                        packet, ("127.0.0.1", self.tunnel_port)
-                    )
-                else:
-                    # Write to the TUN file descriptor (Linux/macOS)
-                    bytes_sent = os.write(self.tun_fd, packet)
-                return bytes_sent == len(packet)
-            except BlockingIOError:
-                # The write buffer might be full
-                logger.warning("Write would block. Packet dropped.")
-                return False
-            except OSError as e:
-                # Check for Bad File Descriptor (errno 9)
-                if e.errno == 9:
-                    logger.error(
-                        "Bad file descriptor during write. Tunnel may be closed."
-                    )
-                    self.tun_fd = None  # Mark as closed
-                    self.stop()
-                else:
-                    # Log other OS errors
-                    logger.error(f"OSError writing to tunnel: {e}")
-                return False
-            except Exception as e:
-                # Catch any other unexpected errors during write
-                logger.error(f"Unexpected error writing to tunnel: {e}")
-                self.stop()
-                return False
 
     def register_packet_callback(
         self, destination_ip: str, callback: Callable[[bytes], None]
@@ -670,7 +307,7 @@ class Tunnel:
         while self.running and self.tun_fd is not None:
             try:
                 # Read a packet from the tunnel interface
-                packet = self.read_packet(max_size=4096)
+                packet = self.read(max_size=4096)
 
                 if not packet or len(packet) < 20:  # Minimum IPv4 header size
                     time.sleep(0.01)  # Avoid busy wait
@@ -721,61 +358,78 @@ class Tunnel:
 
         logger.info("Packet reader loop stopped")
 
-    def read(self, mtu: int = 4096) -> bytes | None:
-        """Read a packet from the TUN device (non-blocking)."""
-        if not self.tun_fd:
-            logger.error("TUN device not initialized or closed.")
+    def read(self, max_size=4096) -> Optional[bytes]:
+        """
+        Read a packet from the tunnel (non-blocking).
+
+        Args:
+            max_size: Maximum packet size to read.
+
+        Returns:
+            bytes or None: Packet data if available, None otherwise.
+        """
+        if not self.tun_fd or not self.running:
             return None
 
-        try:
-            # Check if the file descriptor is ready for reading
-            ready_to_read, _, _ = select.select(
-                [self.tun_fd], [], [], 0.01
-            )  # Small timeout
-            if self.tun_fd in ready_to_read:
-                try:
-                    return os.read(self.tun_fd, mtu)
-                except BlockingIOError as e:
-                    # This happens with non-blocking I/O when no data is available
-                    # It's not an error, just return None to indicate no data
-                    if (
-                        e.errno == 11
-                    ):  # Resource temporarily unavailable (EAGAIN/EWOULDBLOCK)
-                        return None
-                    else:
-                        # For other BlockingIOError types, log but don't close the TUN
-                        logger.warning(f"BlockingIOError in read() but not EAGAIN: {e}")
-                        return None
-            else:
-                return None  # No data available
-        except OSError as e:
-            # Only close the TUN device for serious errors, not normal non-blocking behavior
-            if e.errno == 9:  # Bad file descriptor
-                logger.error(f"Bad file descriptor error reading from TUN device: {e}")
-                self.close()  # Attempt to clean up
-            else:
-                logger.warning(
-                    f"OSError reading from TUN device: {e}, continuing operation"
-                )
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error reading from TUN device: {e}")
-            return None
+        with self.read_lock:
+            try:
+                return os.read(self.tun_fd, max_size)
+            except BlockingIOError:
+                # This is expected when no data is available on non-blocking fd
+                return None
+            except OSError as e:
+                # Check for Bad File Descriptor (errno 9)
+                if e.errno == 9:
+                    logger.error(
+                        "Bad file descriptor during read. Tunnel may be closed."
+                    )
+                    self.tun_fd = None  # Mark as closed
+                    self.stop()
+                else:
+                    # Log other OS errors
+                    logger.error(f"OSError reading from tunnel: {e}")
+                return None
+            except Exception as e:
+                # Catch any other unexpected errors during read
+                logger.error(f"Unexpected error reading from tunnel: {e}")
+                self.stop()
+                return None
 
-    def write(self, packet: bytes) -> int | None:
-        """Write a packet to the TUN device."""
-        if not self.tun_fd:
-            logger.error("TUN device not initialized or closed.")
-            return None
-        try:
-            return os.write(self.tun_fd, packet)
-        except OSError as e:
-            logger.error(f"Error writing to TUN device: {e}")
-            self.close()  # Attempt to clean up
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected error writing to TUN device: {e}")
-            return None
+    def write(self, packet: bytes) -> bool:
+        """
+        Write a packet to the tunnel.
+
+        Args:
+            packet: Packet data to write.
+
+        Returns:
+            bool: True if write was successful, False otherwise.
+        """
+        if not self.tun_fd or not self.running:
+            logger.warning("Tunnel not ready or not running for writing.")
+            return False
+
+        with self.write_lock:
+            try:
+                bytes_sent = os.write(self.tun_fd, packet)
+                return bytes_sent == len(packet)
+            except OSError as e:
+                # Check for Bad File Descriptor (errno 9)
+                if e.errno == 9:
+                    logger.error(
+                        "Bad file descriptor during write. Tunnel may be closed."
+                    )
+                    self.tun_fd = None  # Mark as closed
+                    self.stop()
+                else:
+                    # Log other OS errors
+                    logger.error(f"OSError writing to tunnel: {e}")
+                return False
+            except Exception as e:
+                # Catch any other unexpected errors during write
+                logger.error(f"Unexpected error writing to tunnel: {e}")
+                self.stop()
+                return False
 
     def close(self):
         """Clean up the TUN device."""
@@ -787,30 +441,14 @@ class Tunnel:
             except OSError as e:
                 logger.error(f"Error closing TUN device {self.interface_name}: {e}")
 
-        # Teardown commands (consider platform specifics if needed)
+        # Teardown commands
         try:
-            if sys.platform.startswith("linux"):
-                # Bring the interface down
-                subprocess.run(
-                    ["ip", "link", "set", "dev", self.interface_name, "down"],
-                    check=False,
-                )
-                # Optionally delete the interface (might require root)
-                # subprocess.run(["ip", "tuntap", "del", "dev", self.interface_name, "mode", "tun"], check=False)
-                logger.info(f"Brought down interface {self.interface_name}")
-            elif sys.platform == "darwin":
-                # On macOS, closing the FD usually suffices, but explicit down might be good
-                subprocess.run(["ifconfig", self.interface_name, "down"], check=False)
-                logger.info(f"Brought down interface {self.interface_name}")
-
-        except FileNotFoundError:
-            logger.warning(
-                "Network configuration commands (ip/ifconfig) not found during cleanup."
+            # Bring the interface down
+            subprocess.run(
+                ["ip", "link", "set", "dev", self.interface_name, "down"],
+                check=False,
             )
-        except subprocess.CalledProcessError as e:
-            logger.warning(
-                f"Error during interface teardown for {self.interface_name}: {e}"
-            )
+            logger.info(f"Brought down interface {self.interface_name}")
         except Exception as e:
             logger.error(f"Unexpected error during interface teardown: {e}")
 
@@ -832,42 +470,26 @@ if __name__ == "__main__":
     logger.info("Starting Tunnel example...")
 
     # Choose interface name and IP based on platform needs
-    if platform.system().lower() == "windows":
-        if_name = "LoopbackTunnel"  # Name is conceptual on Windows proxy
-        ip_addr = "10.10.0.100"  # Example IP
-    elif platform.system().lower() == "linux":
-        if_name = "tun_smesh0"
-        ip_addr = "10.10.0.10"
-    elif platform.system().lower() == "darwin":
-        if_name = "utun_smesh"  # Actual name will be utunX
-        ip_addr = "10.10.0.10"
-    else:
-        logger.error("Unsupported platform for example.")
-        sys.exit(1)
+    if_name = "tun_smesh0"
+    ip_addr = "10.10.0.10"
 
     try:
         # Use context manager for automatic setup and cleanup
         with Tunnel(interface_name=if_name, local_ip=ip_addr) as tunnel:
             logger.info(f"Tunnel interface '{tunnel.interface_name}' is up.")
 
-            # Register a callback (especially useful for Windows)
-            tunnel.register_packet_callback(handle_packet_from_tunnel)
+            # Register a callback
+            tunnel.register_packet_callback("10.10.0.2", handle_packet_from_tunnel)
 
             logger.info("Tunnel running. Press Ctrl+C to stop.")
 
-            # Keep the main thread alive while the tunnel runs
-            # On Linux/macOS, you might read packets here instead of using callbacks
-            if tunnel.os_name != "windows":
-                while tunnel.running:
-                    packet = tunnel.read_packet()
-                    if packet:
-                        handle_packet_from_tunnel(packet)
-                    else:
-                        time.sleep(0.01)  # Prevent busy-waiting
-            else:
-                # On Windows, the handler thread runs the callbacks
-                while tunnel.running:
-                    time.sleep(1)
+            # Simple example loop
+            while tunnel.running:
+                packet = tunnel.read()
+                if packet:
+                    handle_packet_from_tunnel(packet)
+                else:
+                    time.sleep(0.01)  # Prevent busy-waiting
 
     except KeyboardInterrupt:
         logger.info("Ctrl+C received, shutting down.")
