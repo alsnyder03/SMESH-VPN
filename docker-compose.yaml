@@ -1,5 +1,3 @@
-version: "3"
-
 services:
   discovery:
     build:
@@ -16,7 +14,9 @@ services:
       - NET_ADMIN
     command: python server/discovery_server.py
     volumes:
-      - ./server:/app/server
+      - ./:/app
+    environment:
+      - CA_DIR=/app/ca
 
   client1:
     build:
@@ -26,6 +26,7 @@ services:
     depends_on:
       - discovery
     networks:
+      # All clients connected to discovery server but isolated from each other directly
       meshnet:
         ipv4_address: 172.20.0.10
     cap_add:
@@ -43,8 +44,10 @@ services:
       - PORT=9010
       - PYTHONUNBUFFERED=1
       - INTERFACE_NAME=smesh_tun1
+      - CLIENT_ID=54e73c56-29d6-40aa-8f45-9bd7c82e07e6
+      - CERT_DIR=/app/ca
     volumes:
-      - ./client:/app/client
+      - ./:/app
 
   client2:
     build:
@@ -72,8 +75,10 @@ services:
       - PORT=9020
       - PYTHONUNBUFFERED=1
       - INTERFACE_NAME=smesh_tun2
+      - CLIENT_ID=e02e2375-a135-4b2d-b1a4-a174d3c00aed
+      - CERT_DIR=/app/ca
     volumes:
-      - ./client:/app/client
+      - ./:/app
 
   client3:
     build:
@@ -101,8 +106,10 @@ services:
       - PORT=9030
       - PYTHONUNBUFFERED=1
       - INTERFACE_NAME=smesh_tun3
+      - CLIENT_ID=148bb6ce-aaea-45d9-852f-2a46f9468f5f
+      - CERT_DIR=/app/ca
     volumes:
-      - ./client:/app/client
+      - ./:/app
 
 networks:
   meshnet:

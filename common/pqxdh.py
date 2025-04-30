@@ -21,7 +21,6 @@ class PQXDHServer:
 
     def generate_keys(self):
         """Generate classical key pair"""
-        # Generate classical X25519 (elliptic curve) keys
         self.classical_private_key = x448.X448PrivateKey.generate()
         self.classical_public_key = self.classical_private_key.public_key()
 
