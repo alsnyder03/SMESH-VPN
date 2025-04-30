@@ -1,85 +1,120 @@
 # SMESH-VPN
 
-A mesh-based Virtual Private Network system where each node can communicate directly with other nodes in the network without relying on a central server for routing traffic.
+A secure mesh VPN with Post-Quantum Cryptography.
 
 ## Features
 
-- Fully decentralized mesh network topology
-- Encrypted peer-to-peer connections
-- Automatic peer discovery
-- NAT traversal capabilities
-- Cross-platform support (Linux, Windows, macOS)
+- Post-quantum secure key exchange using hybrid classical/post-quantum cryptography
+- End-to-end encrypted communication between nodes
+- Mesh topology allowing direct peer-to-peer connections
+- Certificate-based identity system for secure authentication
+- Protection against MITM attacks during key exchange
+- Automatic peer discovery through a central discovery server
 
-## Components
+## Requirements
 
-### Client
-
-The client establishes encrypted tunnels to other peers in the mesh network, handles routing, and manages the virtual network interface.
-
-### Discovery Server
-
-The discovery server helps peers find each other on the network. It acts only as a facilitator for initial connection and doesn't route any VPN traffic.
+- Python 3.8+
+- pytun/tunctl or equivalent (for TUN interface support)
 
 ## Installation
 
+1. Clone the repository:
+
 ```bash
-# Clone the repository
 git clone https://github.com/yourusername/SMESH-VPN.git
 cd SMESH-VPN
 ```
 
-Venv must exist
+2. Install dependencies:
 
 ```bash
-python -m venv .venv
+pip install -r requirements.txt
 ```
 
-```ps
-./.venv/Scripts/activate.ps1
-```
+## Certificate Setup
+
+SMESH-VPN uses certificate-based authentication to ensure that only authorized clients can connect to the network and to protect against MITM attacks.
+
+### Create a Certificate Authority (CA)
+
+Before clients can connect, you need to set up a Certificate Authority:
 
 ```bash
-./install.sh
+python ca_manager.py --create-ca --ca-dir ca
 ```
 
-or equivalent for other operating system
+### Issue Client Certificates
 
-## Usage
-
-### Running the Discovery Server
+Issue certificates for each client that needs to connect:
 
 ```bash
-python server/discovery_server.py
+python ca_manager.py --issue-cert --ca-dir ca --common-name "Client1"
 ```
 
-### Running the Client
+This will generate a client certificate in the `ca/clients/<client_id>` directory.
+
+### List Authorized Clients
+
+To view all authorized clients:
 
 ```bash
-python client/client.py
+python ca_manager.py --list-clients --ca-dir ca
 ```
 
-The client will create a virtual network interface and establish connections with other peers in the mesh.
+### Revoke Client Certificates
 
-## Configuration
+To revoke a certificate:
 
-Create a JSON configuration file at `~/.mesh_vpn/config.json`:
+```bash
+python ca_manager.py --revoke-cert --ca-dir ca --client-id <client_id>
+```
 
-```json
-{
-  "listen_port": 9000,
-  "discovery_servers": ["mesh-discovery.example.com:8000"],
-  "interface": "tun0",
-  "subnet": "10.10.0.0/24",
-  "local_ip": "10.10.0.1"
-}
+## Running the Discovery Server
+
+Start the discovery server:
+
+```bash
+sudo python server/discovery_server.py
+```
+
+## Running a Client
+
+Start a VPN client with certificate authentication:
+
+```bash
+sudo python client/client.py --cert-dir ca/clients/<client_id> --client-id <client_id>
+```
+
+Or specify additional parameters:
+
+```bash
+sudo python client/client.py -i 10.10.0.2 -p 9000 -d discovery.example.com:8000 --cert-dir ca/clients/<client_id> --client-id <client_id>
 ```
 
 ## Security Considerations
 
-- All traffic between peers is encrypted
-- Peers authenticate each other using public key cryptography
-- The system doesn't rely on a central point for traffic routing, increasing privacy
+- The certificates are used to authenticate clients during connection establishment
+- All key exchanges are protected against MITM attacks
+- Only authorized clients with valid certificates can connect to the VPN
+- The discovery server validates client certificates before allowing connections
+- All data exchanged between peers is end-to-end encrypted
+
+## Docker Support
+
+You can also run the VPN components in Docker:
+
+```bash
+docker-compose up -d
+```
+
+## Testing
+
+Run the tests:
+
+```bash
+python -m unittest discover tests
+```
 
 ## License
 
-MIT License
+This project is licensed under the MIT License - see the LICENSE file for details.

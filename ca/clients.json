@@ -1,0 +1,18 @@
+{
+  "server": {
+    "common_name": "SMESH-VPN Server",
+    "expires_at": "2026-04-30T02:00:49.895740"
+  },
+  "54e73c56-29d6-40aa-8f45-9bd7c82e07e6": {
+    "common_name": "Client1",
+    "expires_at": "2026-04-30T02:01:17.832148"
+  },
+  "e02e2375-a135-4b2d-b1a4-a174d3c00aed": {
+    "common_name": "Client2",
+    "expires_at": "2026-04-30T02:01:56.738938"
+  },
+  "148bb6ce-aaea-45d9-852f-2a46f9468f5f": {
+    "common_name": "Client3",
+    "expires_at": "2026-04-30T02:02:18.214825"
+  }
+}
