@@ -1,5 +1,6 @@
 # Python virtual environments
 .linux_venv/
+.linuxVenv/
 venv/
 env/
 .env/
